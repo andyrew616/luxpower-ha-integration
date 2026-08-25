@@ -64,6 +64,27 @@ Configuration is done entirely through the Home Assistant UI.
 | **Enable Device Grouping** | boolean | (v0.2.0+) Group entities into logical sub-devices for better organization (default: enabled). |
 | **Battery Entities** | string | (v1.0.0+) Battery monitoring configuration: `none` (disabled), `auto` (auto-discover), or comma-separated battery serial numbers. |
 
+### Standalone read client
+
+Source checkouts also expose a Home Assistant-independent, read-only API. It uses
+the same packet builder, response parser, polling cadence, connection lifecycle,
+validation, recovery, retry, and cache implementation as the integration:
+
+```python
+from luxpower import LuxPowerReadClient
+
+client = LuxPowerReadClient(
+    host="192.0.2.1",
+    port=8000,
+    dongle_serial="DG00000001",
+    inverter_serial="0000000001",
+)
+telemetry = await client.async_read()
+```
+
+`telemetry` contains decoded input registers, holding registers, and any requested
+battery data. The standalone facade intentionally provides no write operation.
+
 > [!WARNING]
 > ### Important Note on Read-Only Mode (Available since v0.1.5)
 >

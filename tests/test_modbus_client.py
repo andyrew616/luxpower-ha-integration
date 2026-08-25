@@ -5,8 +5,6 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 import time as time_lib
 
-from homeassistant.helpers.update_coordinator import UpdateFailed
-
 # Import the module under test
 import sys
 import os
@@ -16,6 +14,7 @@ from custom_components.lxp_modbus.classes.modbus_client import LxpModbusApiClien
 from custom_components.lxp_modbus.classes.data_validator import is_data_sane
 from custom_components.lxp_modbus.classes.lxp_response import LxpResponse
 from custom_components.lxp_modbus.classes.lxp_request_builder import LxpRequestBuilder
+from custom_components.lxp_modbus.exceptions import LuxPowerCommunicationError
 from custom_components.lxp_modbus.const import (
     DEFAULT_CONNECTION_RETRIES, TOTAL_REGISTERS, RESPONSE_OVERHEAD,
     WRITE_RESPONSE_LENGTH, MAX_PACKET_RECOVERY_ATTEMPTS, PACKET_RECOVERY_TIMEOUT,
@@ -316,7 +315,7 @@ class TestLxpModbusApiClient:
             # With nothing cached there is nothing honest to report, so the failure
             # is surfaced immediately instead of an empty dataset that looks like a
             # successful poll to the coordinator.
-            with pytest.raises(UpdateFailed):
+            with pytest.raises(LuxPowerCommunicationError):
                 await client.async_get_data()
 
     @pytest.mark.asyncio
@@ -351,7 +350,7 @@ class TestLxpModbusApiClient:
                 assert result["input"] == {0: 100}
 
             # The window is now exhausted, so the failure must be surfaced.
-            with pytest.raises(UpdateFailed):
+            with pytest.raises(LuxPowerCommunicationError):
                 await client.async_get_data()
 
     @pytest.mark.asyncio

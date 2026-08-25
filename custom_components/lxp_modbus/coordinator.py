@@ -8,6 +8,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import INTEGRATION_TITLE
+from .exceptions import LuxPowerCommunicationError
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -59,9 +60,9 @@ class LxpModbusDataUpdateCoordinator(DataUpdateCoordinator):
         """Fetch data from API endpoint."""
         try:
             data = await self.api_client.async_get_data()
-        except UpdateFailed:
+        except LuxPowerCommunicationError as err:
             self._register_failure()
-            raise
+            raise UpdateFailed(str(err)) from err
         except Exception as err:
             self._register_failure()
             raise UpdateFailed(f"Unexpected error polling the inverter: {err}") from err

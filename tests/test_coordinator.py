@@ -20,6 +20,7 @@ from custom_components.lxp_modbus.coordinator import (
     RECOVERY_ESCALATION_MEDIUM,
     RECOVERY_ESCALATION_HIGH,
 )
+from custom_components.lxp_modbus.exceptions import LuxPowerCommunicationError
 
 
 class TestLxpModbusDataUpdateCoordinator:
@@ -131,18 +132,20 @@ class TestLxpModbusDataUpdateCoordinator:
         assert data == {"input": {0: 100}, "hold": {0: 200}}
 
     # ---------------------------------------------------------------
-    # 4. _async_update_data - UpdateFailed increments counter
+    # 4. _async_update_data - library failure is translated and counted
     # ---------------------------------------------------------------
     @pytest.mark.asyncio
-    async def test_async_update_data_update_failed_increments_counter(self, coordinator):
-        """Test that an UpdateFailed exception increments the failed_updates counter."""
-        coordinator.api_client.async_get_data.side_effect = UpdateFailed("connection lost")
+    async def test_async_update_data_translates_library_failure(self, coordinator):
+        """Test that a library failure becomes HA UpdateFailed and is counted."""
+        library_error = LuxPowerCommunicationError("connection lost")
+        coordinator.api_client.async_get_data.side_effect = library_error
         coordinator._failed_updates = 0
 
-        with pytest.raises(UpdateFailed):
+        with pytest.raises(UpdateFailed) as raised:
             await coordinator._async_update_data()
 
         assert coordinator._failed_updates == 1
+        assert raised.value.__cause__ is library_error
 
     # ---------------------------------------------------------------
     # 4b. Unexpected errors are reported as UpdateFailed, not leaked raw
@@ -219,7 +222,9 @@ class TestLxpModbusDataUpdateCoordinator:
     @pytest.mark.asyncio
     async def test_recovery_mode_triggers_at_threshold(self, coordinator):
         """Test that recovery mode is triggered exactly at RECOVERY_MODE_THRESHOLD consecutive failures."""
-        coordinator.api_client.async_get_data.side_effect = UpdateFailed("connection lost")
+        coordinator.api_client.async_get_data.side_effect = LuxPowerCommunicationError(
+            "connection lost"
+        )
 
         # Fail (RECOVERY_MODE_THRESHOLD - 1) times -- recovery should NOT trigger yet
         for _ in range(RECOVERY_MODE_THRESHOLD - 1):
