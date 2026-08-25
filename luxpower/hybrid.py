@@ -15,13 +15,19 @@ import time
 from typing import Mapping, Sequence
 
 from custom_components.lxp_modbus.classes.read_session import (
+    LuxObservationSource,
     LuxReadSession,
     LuxReadSessionMetrics,
     LuxReadSessionSnapshot,
 )
 from custom_components.lxp_modbus.const import TOTAL_REGISTERS
 from custom_components.lxp_modbus.exceptions import LuxPowerCommunicationError
-from custom_components.lxp_modbus.observation import require_aware_utc, utc_now
+from custom_components.lxp_modbus.observation import utc_now
+from custom_components.lxp_modbus.read_profiles import (
+    EnergyFlowReadProfile,
+    EnergyFlowSnapshot,
+    InputReadBlock,
+)
 from custom_components.lxp_modbus.telemetry_groups import (
     TelemetryGroup,
     input_register_group,
@@ -31,21 +37,6 @@ from custom_components.lxp_modbus.telemetry_groups import (
 HYBRID_SCHEMA_VERSION = 1
 HYBRID_VERSION = "1.0"
 HARDWARE_READ_BLOCK_SIZE = 40
-
-
-@dataclass(frozen=True)
-class InputReadBlock:
-    """One experimentally proven aligned FC4 input-register block."""
-
-    start: int
-    count: int
-
-    @property
-    def end(self) -> int:
-        return self.start + self.count - 1
-
-    def addresses(self) -> range:
-        return range(self.start, self.end + 1)
 
 
 OPERATIONAL_READ_BLOCKS = tuple(
@@ -84,6 +75,35 @@ class HybridRefreshResult:
     duration_ms: float
 
 
+@dataclass(frozen=True)
+class HybridProfileRefreshResult:
+    """One freshness-driven read-profile acquisition decision."""
+
+    requested_blocks: tuple[InputReadBlock, ...]
+    fresh_blocks_skipped: tuple[InputReadBlock, ...]
+    blocks_satisfied_unsolicited: tuple[InputReadBlock, ...]
+    duration_ms: float
+
+
+@dataclass(frozen=True)
+class HybridProfileMetrics:
+    """Source-aware profile decisions, excluding forced reads and full scans."""
+
+    explicit_requests_attempted: int
+    explicit_requests_avoided_unsolicited: int
+    blocks_satisfied_unsolicited: int
+
+    @property
+    def avoidance_percent(self) -> float | None:
+        opportunities = (
+            self.explicit_requests_attempted
+            + self.explicit_requests_avoided_unsolicited
+        )
+        if not opportunities:
+            return None
+        return 100 * self.explicit_requests_avoided_unsolicited / opportunities
+
+
 class LuxPowerHybridReadClient:
     """Experimental persistent FC4 client with freshness-driven read suppression.
 
@@ -99,6 +119,7 @@ class LuxPowerHybridReadClient:
         port: int = 8000,
         freshness_target: timedelta = timedelta(seconds=5),
         full_scan_interval: timedelta = timedelta(seconds=60),
+        profile: EnergyFlowReadProfile | None = None,
         session: LuxReadSession | None = None,
     ) -> None:
         if freshness_target.total_seconds() <= 0:
@@ -113,7 +134,14 @@ class LuxPowerHybridReadClient:
         )
         self._freshness_target = freshness_target
         self._full_scan_interval = full_scan_interval
+        self._profile = profile
         self._last_full_scan_completed_at: datetime | None = None
+        self._profile_explicit_requests = 0
+        self._profile_unsolicited_avoided = 0
+        self._profile_accounted_observations: dict[
+            InputReadBlock, tuple[datetime, ...]
+        ] = {}
+        self._last_profile_request_block: InputReadBlock | None = None
 
     async def async_connect(self) -> None:
         await self._session.async_connect()
@@ -132,6 +160,29 @@ class LuxPowerHybridReadClient:
 
     def metrics(self) -> LuxReadSessionMetrics:
         return self._session.metrics()
+
+    @property
+    def profile(self) -> EnergyFlowReadProfile | None:
+        """The resolved experimental profile, if configured."""
+        return self._profile
+
+    def profile_snapshot(self) -> EnergyFlowSnapshot:
+        """Return a typed profile snapshot with truthful derived freshness."""
+        if self._profile is None:
+            raise ValueError("no read profile configured")
+        return self._profile.snapshot(self._session.snapshot())
+
+    def profile_metrics(self) -> HybridProfileMetrics:
+        return HybridProfileMetrics(
+            explicit_requests_attempted=self._profile_explicit_requests,
+            explicit_requests_avoided_unsolicited=self._profile_unsolicited_avoided,
+            blocks_satisfied_unsolicited=self._profile_unsolicited_avoided,
+        )
+
+    @property
+    def last_profile_request_block(self) -> InputReadBlock | None:
+        """Sanitized identity of the most recently attempted profile block."""
+        return self._last_profile_request_block
 
     def drain_observations(self):
         """Return queued sanitized observation objects for measurement."""
@@ -159,6 +210,95 @@ class LuxPowerHybridReadClient:
         return HybridRefreshResult(
             requested_blocks=tuple(requested),
             fresh_blocks_skipped=tuple(skipped),
+            duration_ms=(time.monotonic() - started) * 1000,
+        )
+
+    async def async_refresh_profile(self) -> HybridProfileRefreshResult:
+        """Refresh only stale registers required by the configured profile."""
+        if self._profile is None:
+            raise ValueError("no read profile configured")
+        started = time.monotonic()
+        requested: list[InputReadBlock] = []
+        skipped: list[InputReadBlock] = []
+        unsolicited: list[InputReadBlock] = []
+        for block in self._profile.read_blocks:
+            snapshot = self._session.snapshot()
+            now = utc_now()
+            required = self._profile.required_registers_in(block)
+            fresh = self._required_registers_are_fresh(required, snapshot, now)
+            observations = snapshot.observed_at.input_registers
+            signature = (
+                tuple(observations[register] for register in sorted(required))
+                if all(register in observations for register in required)
+                else None
+            )
+            accounted = self._profile_accounted_observations.get(block)
+            if accounted is None and all(
+                register in snapshot.explicit_observed_at for register in required
+            ):
+                accounted = tuple(
+                    snapshot.explicit_observed_at[register]
+                    for register in sorted(required)
+                )
+                self._profile_accounted_observations[block] = accounted
+            opportunity_due = bool(
+                accounted is None
+                or now - min(accounted) >= self._freshness_target
+            )
+            if fresh:
+                skipped.append(block)
+                if opportunity_due and signature is not None and signature != accounted:
+                    due_indexes = (
+                        tuple(range(len(signature)))
+                        if accounted is None
+                        else tuple(
+                            index
+                            for index, observed in enumerate(accounted)
+                            if now - observed >= self._freshness_target
+                        )
+                    )
+                    displaced_by_unsolicited = bool(due_indexes) and all(
+                        (accounted is None or signature[index] > accounted[index])
+                        and snapshot.input_sources.get(register)
+                        is LuxObservationSource.UNSOLICITED
+                        for index, register in enumerate(sorted(required))
+                        if index in due_indexes
+                    )
+                    if displaced_by_unsolicited:
+                        self._profile_unsolicited_avoided += 1
+                        unsolicited.append(block)
+                    self._profile_accounted_observations[block] = signature
+                elif accounted is None and signature is not None:
+                    self._profile_accounted_observations[block] = signature
+                continue
+            self._profile_explicit_requests += 1
+            self._last_profile_request_block = block
+            await self._session.async_read_input(block.start, block.count)
+            requested.append(block)
+            refreshed = self._session.snapshot().observed_at.input_registers
+            if all(register in refreshed for register in required):
+                self._profile_accounted_observations[block] = tuple(
+                    refreshed[register] for register in sorted(required)
+                )
+        return HybridProfileRefreshResult(
+            requested_blocks=tuple(requested),
+            fresh_blocks_skipped=tuple(skipped),
+            blocks_satisfied_unsolicited=tuple(unsolicited),
+            duration_ms=(time.monotonic() - started) * 1000,
+        )
+
+    async def async_read_profile(self) -> HybridProfileRefreshResult:
+        """Force one profile read for timing; excluded from avoidance metrics."""
+        if self._profile is None:
+            raise ValueError("no read profile configured")
+        started = time.monotonic()
+        for block in self._profile.read_blocks:
+            self._last_profile_request_block = block
+            await self._session.async_read_input(block.start, block.count)
+        return HybridProfileRefreshResult(
+            requested_blocks=self._profile.read_blocks,
+            fresh_blocks_skipped=(),
+            blocks_satisfied_unsolicited=(),
             duration_ms=(time.monotonic() - started) * 1000,
         )
 
@@ -238,6 +378,57 @@ class LuxPowerHybridReadClient:
                 pass
         return samples
 
+    async def async_run_profile(
+        self,
+        duration: float,
+        *,
+        sample_interval: float = 0.1,
+        sample_sink: list[dict] | None = None,
+    ) -> list[dict]:
+        """Run bounded profile-only acquisition; full scans remain separate."""
+        if self._profile is None:
+            raise ValueError("no read profile configured")
+        if duration <= 0 or sample_interval <= 0:
+            raise ValueError("duration and sample_interval must be positive")
+        deadline = time.monotonic() + duration
+        samples = sample_sink if sample_sink is not None else []
+        acquisition_done = asyncio.Event()
+
+        def sample_freshness() -> None:
+            now = utc_now()
+            samples.append(
+                {
+                    "at": now.isoformat(),
+                    "profile_freshness": self._profile_freshness_summary(
+                        self._session.snapshot(), now
+                    ),
+                }
+            )
+
+        async def monitor_freshness() -> None:
+            while not acquisition_done.is_set():
+                sample_freshness()
+                try:
+                    await asyncio.wait_for(
+                        acquisition_done.wait(), timeout=sample_interval
+                    )
+                except asyncio.TimeoutError:
+                    pass
+            sample_freshness()
+
+        monitor = asyncio.create_task(monitor_freshness())
+        try:
+            while time.monotonic() < deadline:
+                await self.async_refresh_profile()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                await asyncio.sleep(min(0.1, remaining))
+        finally:
+            acquisition_done.set()
+            await monitor
+        return samples
+
     def _block_is_fresh(
         self,
         block: InputReadBlock,
@@ -252,6 +443,46 @@ class LuxPowerHybridReadClient:
             for register in block.addresses()
             if input_register_group(register) is TelemetryGroup.OPERATIONAL
         )
+
+    def _required_registers_are_fresh(
+        self,
+        required: frozenset[int],
+        snapshot: LuxReadSessionSnapshot,
+        now: datetime,
+    ) -> bool:
+        observations = snapshot.observed_at.input_registers
+        return bool(required) and all(
+            register in observations
+            and now - observations[register] <= self._freshness_target
+            for register in required
+        )
+
+    def _profile_freshness_summary(
+        self,
+        snapshot: LuxReadSessionSnapshot,
+        now: datetime,
+    ) -> dict:
+        if self._profile is None:
+            raise ValueError("no read profile configured")
+        observations = snapshot.observed_at.input_registers
+        ages_by_register = {
+            register: (now - observations[register]).total_seconds()
+            for register in self._profile.required_registers
+            if register in observations
+        }
+        ages = tuple(ages_by_register.values())
+        worst_register = (
+            max(ages_by_register, key=ages_by_register.get)
+            if ages_by_register
+            else None
+        )
+        return {
+            "known": len(ages),
+            "required": len(self._profile.required_registers),
+            "median_age_seconds": round(statistics.median(ages), 3) if ages else None,
+            "max_age_seconds": round(max(ages), 3) if ages else None,
+            "worst_register": worst_register,
+        }
 
     @staticmethod
     def _freshness_summary(
