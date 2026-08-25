@@ -14,8 +14,12 @@ from custom_components.lxp_modbus.telemetry_groups import (
     input_registers_for_group,
 )
 from custom_components.lxp_modbus.exceptions import (
+    LuxPowerAmbiguousRequestError,
     LuxPowerCommunicationError,
+    LuxPowerConnectionError,
+    LuxPowerConnectionLostError,
     LuxPowerError,
+    LuxPowerRecoveryExhaustedError,
     LuxPowerReadRejectedError,
     LuxPowerReadTimeoutError,
     LuxPowerSessionClosedError,
@@ -39,10 +43,22 @@ from custom_components.lxp_modbus.read_profiles import (
     plan_aligned_input_blocks,
     profile_block_details,
 )
+from custom_components.lxp_modbus.recovery import (
+    AcquisitionHealth,
+    RecoveryEvent,
+    RecoveryFailureKind,
+    RecoveryMetrics,
+    RecoveryPolicy,
+)
 
 __all__ = [
+    "AcquisitionHealth",
+    "LuxPowerAmbiguousRequestError",
     "LuxPowerCommunicationError",
+    "LuxPowerConnectionError",
+    "LuxPowerConnectionLostError",
     "LuxPowerError",
+    "LuxPowerRecoveryExhaustedError",
     "LuxPowerReadRejectedError",
     "LuxPowerReadTimeoutError",
     "LuxPowerSessionClosedError",
@@ -70,4 +86,8 @@ __all__ = [
     "ReadProfileName",
     "plan_aligned_input_blocks",
     "profile_block_details",
+    "RecoveryEvent",
+    "RecoveryFailureKind",
+    "RecoveryMetrics",
+    "RecoveryPolicy",
 ]

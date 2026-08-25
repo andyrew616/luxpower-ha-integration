@@ -11,7 +11,10 @@ import pytest
 from luxpower.profile_validation import (
     _load_private_target,
     _nearest_rank_p95,
+    _nearest_rank_p99,
     _time_beyond_target,
+    _time_beyond_target_by_health_state,
+    _time_beyond_target_by_recovery_episode,
     summarize_profile_samples,
 )
 
@@ -35,27 +38,33 @@ def test_nearest_rank_statistics_and_profile_freshness_summary():
         "complete_samples": 4,
         "median_worst_age_seconds": 2.5,
         "p95_worst_age_seconds": 4.0,
+        "p99_worst_age_seconds": None,
         "max_worst_age_seconds": 4.0,
         "worst_register_sample_counts": {"0": 2, "170": 2},
     }
+
+    assert _nearest_rank_p99(list(range(100))) == 98
 
 
 def test_time_beyond_target_uses_actual_sample_intervals():
     samples = [
         {
             "at": "2026-08-25T12:00:00+00:00",
+            "acquisition_health": "recovering",
             "profile_freshness": {
                 "known": 1, "required": 1, "max_age_seconds": 5.1
             },
         },
         {
             "at": "2026-08-25T12:00:00.125000+00:00",
+            "acquisition_health": "healthy",
             "profile_freshness": {
                 "known": 1, "required": 1, "max_age_seconds": 4.0
             },
         },
         {
             "at": "2026-08-25T12:00:00.240000+00:00",
+            "acquisition_health": "healthy",
             "profile_freshness": {
                 "known": 1, "required": 1, "max_age_seconds": 4.1
             },
@@ -63,6 +72,18 @@ def test_time_beyond_target_uses_actual_sample_intervals():
     ]
 
     assert _time_beyond_target(samples, 5.0) == 0.125
+    assert _time_beyond_target_by_health_state(samples, 5.0) == {
+        "while_recovering": 0.125,
+        "outside_recovering": 0.0,
+    }
+    events = [{
+        "episode_started_at": "2026-08-25T11:59:59.900000+00:00",
+        "ended_at": "2026-08-25T12:00:00.200000+00:00",
+    }]
+    assert _time_beyond_target_by_recovery_episode(samples, 5.0, events) == {
+        "recovery_episode": 0.125,
+        "normal_operation": 0.0,
+    }
 
 
 def test_private_target_loader_returns_values_without_serializing_them():

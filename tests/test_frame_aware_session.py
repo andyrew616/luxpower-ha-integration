@@ -14,6 +14,8 @@ from custom_components.lxp_modbus.classes.read_session import (
     LuxReadSession,
 )
 from custom_components.lxp_modbus.exceptions import (
+    LuxPowerAmbiguousRequestError,
+    LuxPowerConnectionError,
     LuxPowerCommunicationError,
     LuxPowerReadTimeoutError,
     LuxPowerSessionClosedError,
@@ -363,6 +365,164 @@ async def test_timeout_taints_connection_and_late_response_cannot_cross_reconnec
     assert session.metrics().connections == 2
     assert session.metrics().expected_fc4_responses == 1
     await session.async_close()
+
+
+@pytest.mark.asyncio
+async def test_timeout_taints_before_waiting_for_lifecycle_cleanup_lock():
+    reader = QueueReader()
+    session = make_session(reader, FakeWriter(), request_timeout=0.01)
+    await session.async_connect()
+    await session._lifecycle_lock.acquire()
+    request = asyncio.create_task(session.async_read_input(0, 40))
+    await asyncio.sleep(0.02)
+
+    # The timeout handler is blocked entering async_close. Its synchronous
+    # taint must already make this late frame unable to refresh the cache.
+    reader.feed(input_response(0))
+    await asyncio.sleep(0.01)
+    assert session.snapshot().input_registers == {}
+    assert session.metrics().validated_fc4_frames == 0
+
+    session._lifecycle_lock.release()
+    with pytest.raises(LuxPowerReadTimeoutError):
+        await request
+
+
+@pytest.mark.asyncio
+async def test_cancellation_suppressing_old_reader_cannot_cross_generation():
+    class CancellationSuppressingReader:
+        async def read(self, _count):
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                return input_response(0)
+
+    old_reader = CancellationSuppressingReader()
+    new_reader = QueueReader()
+    writers = [
+        FakeWriter(),
+        FakeWriter(lambda _packet: new_reader.feed(input_response(0))),
+    ]
+    connections = iter(((old_reader, writers[0]), (new_reader, writers[1])))
+
+    async def connector(_host, _port):
+        return next(connections)
+
+    session = LuxReadSession(
+        "192.0.2.1", DONGLE.decode(), INVERTER.decode(), connector=connector
+    )
+    await session.async_connect()
+    await asyncio.sleep(0)
+    await session.async_close()
+
+    assert session.snapshot().input_registers == {}
+    assert session.metrics().frames_received == 0
+
+    await session.async_connect()
+    result = await session.async_read_input(0, 40)
+    assert result.explicit_response is True
+    assert session.metrics().expected_fc4_responses == 1
+    await session.async_close()
+
+
+@pytest.mark.asyncio
+async def test_reconnect_starts_empty_and_does_not_advance_freshness():
+    readers = [QueueReader(), QueueReader()]
+    writers = [FakeWriter(lambda _packet: readers[0].feed(input_response(0))), FakeWriter()]
+    connections = iter(zip(readers, writers))
+
+    async def connector(_host, _port):
+        return next(connections)
+
+    session = LuxReadSession(
+        "192.0.2.1", DONGLE.decode(), INVERTER.decode(), connector=connector
+    )
+    await session.async_connect()
+    await session.async_read_input(0, 40)
+    before = session.snapshot()
+    readers[0].feed(input_response(40)[:20])
+    await asyncio.sleep(0.01)
+    await session.async_close()
+    await session.async_connect()
+    after = session.snapshot()
+
+    assert after.input_registers == before.input_registers
+    assert after.observed_at.input_registers == before.observed_at.input_registers
+    assert session.metrics().decoder_buffered_bytes == 0
+    await session.async_close()
+
+
+@pytest.mark.asyncio
+async def test_connection_establishment_failure_is_typed_and_counted():
+    async def connector(_host, _port):
+        raise ConnectionRefusedError
+
+    session = LuxReadSession(
+        "192.0.2.1", DONGLE.decode(), INVERTER.decode(), connector=connector
+    )
+
+    with pytest.raises(LuxPowerConnectionError):
+        await session.async_connect()
+
+    assert session.metrics().connection_attempts == 1
+    assert session.metrics().connection_failures == 1
+
+
+@pytest.mark.asyncio
+async def test_drain_timeout_is_ambiguous_not_response_timeout():
+    reader = QueueReader()
+
+    class SlowDrainWriter(FakeWriter):
+        async def drain(self):
+            await asyncio.Event().wait()
+
+    session = make_session(reader, SlowDrainWriter(), request_timeout=0.01)
+    await session.async_connect()
+
+    with pytest.raises(LuxPowerAmbiguousRequestError):
+        await session.async_read_input(0, 40)
+
+    assert session.metrics().ambiguous_requests == 1
+    assert session.metrics().request_timeouts == 0
+
+
+@pytest.mark.asyncio
+async def test_idle_eof_is_classified_on_next_acquisition():
+    reader = QueueReader()
+    session = make_session(reader, FakeWriter())
+    await session.async_connect()
+    reader.eof()
+    await asyncio.sleep(0.01)
+
+    from custom_components.lxp_modbus.exceptions import LuxPowerConnectionLostError
+    with pytest.raises(LuxPowerConnectionLostError):
+        await session.async_read_input(0, 40)
+
+
+@pytest.mark.asyncio
+async def test_shutdown_during_session_reconnect_delay_prevents_reopen():
+    first_reader = QueueReader()
+    second_reader = QueueReader()
+    first_writer = FakeWriter()
+    second_writer = FakeWriter()
+    connections = iter(((first_reader, first_writer), (second_reader, second_writer)))
+
+    async def connector(_host, _port):
+        return next(connections)
+
+    session = LuxReadSession(
+        "192.0.2.1", DONGLE.decode(), INVERTER.decode(), connector=connector
+    )
+    await session.async_connect()
+    reconnect = asyncio.create_task(session.async_reconnect(delay=0.03))
+    while not first_writer.closed:
+        await asyncio.sleep(0)
+    await session.async_close()
+
+    with pytest.raises(LuxPowerSessionClosedError):
+        await reconnect
+    assert session.connected is False
+    assert session.metrics().connections == 1
 
 
 @pytest.mark.asyncio

@@ -9,6 +9,22 @@ class LuxPowerCommunicationError(LuxPowerError):
     """Raised when inverter communication cannot produce usable telemetry."""
 
 
+class LuxPowerConnectionError(LuxPowerCommunicationError):
+    """Raised when a new read connection cannot be established."""
+
+
+class LuxPowerConnectionLostError(LuxPowerCommunicationError):
+    """Raised when an established frame-aware read connection is lost."""
+
+
+class LuxPowerAmbiguousRequestError(LuxPowerCommunicationError):
+    """Raised when an FC4 request may have been sent but cannot be correlated."""
+
+
+class LuxPowerRecoveryExhaustedError(LuxPowerCommunicationError):
+    """Raised when the configured bounded transport recovery budget is exhausted."""
+
+
 class LuxPowerSessionClosedError(LuxPowerCommunicationError):
     """Raised when a frame-aware read session closes with work outstanding."""
 
