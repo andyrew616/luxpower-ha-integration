@@ -42,8 +42,8 @@ from luxpower.hybrid import (
     _metrics_delta,
 )
 
-PROFILE_VALIDATION_SCHEMA_VERSION = 5
-PROFILE_VALIDATION_VERSION = "5.0"
+PROFILE_VALIDATION_SCHEMA_VERSION = 6
+PROFILE_VALIDATION_VERSION = "6.0"
 
 
 def _maximum_age(freshness: Mapping[str, object]) -> float | None:
@@ -513,9 +513,9 @@ def aggregate_qualification_reports(
     """Aggregate sanitized sustained phases without inferring long-term rates."""
     phases: list[tuple[Mapping[str, object], Mapping[str, object]]] = []
     for report in reports:
-        if int(report.get("schema_version", 0)) not in (3, 4, 5):
+        if int(report.get("schema_version", 0)) not in (3, 4, 5, 6):
             raise ValueError(
-                "qualification aggregation requires schema-v3/v4/v5 reports"
+                "qualification aggregation requires schema-v3/v4/v5/v6 reports"
             )
         phases.extend(
             (report, phase)
@@ -527,42 +527,65 @@ def aggregate_qualification_reports(
     targets = {float(phase["target_seconds"]) for _, phase in phases}
     if len(targets) != 1:
         raise ValueError("qualification reports use different freshness targets")
-    schema_v5_reports = [
-        report for report in reports if int(report.get("schema_version", 0)) == 5
+    report_schemas: set[int] = set()
+    provenance_reports = [
+        report for report in reports if int(report.get("schema_version", 0)) >= 5
     ]
-    if schema_v5_reports:
-        if len(schema_v5_reports) != len(reports):
+    if provenance_reports:
+        report_schemas = {
+            int(report.get("schema_version", 0)) for report in provenance_reports
+        }
+        if len(provenance_reports) != len(reports) or len(report_schemas) != 1:
             raise ValueError(
-                "schema-v5 qualification cannot aggregate with older schemas"
+                "schema-v5/v6 qualification cannot aggregate across schemas"
             )
-        provenance_keys = (
+        provenance_keys = [
             "implementation_revision",
             "profile_definition_version",
             "drain_timeout_seconds",
             "reply_timeout_seconds",
             "split_request_deadlines",
-        )
+        ]
+        if report_schemas == {6}:
+            provenance_keys.extend(
+                (
+                    "tcp_keepalive_enabled",
+                    "tcp_keepalive_idle_seconds",
+                    "receive_inactivity_timeout_seconds",
+                )
+            )
+            for report in provenance_reports:
+                provenance = report.get("provenance")
+                missing = [
+                    key
+                    for key in provenance_keys
+                    if not isinstance(provenance, Mapping) or key not in provenance
+                ]
+                if missing:
+                    raise ValueError(
+                        "schema-v6 qualification is missing required provenance"
+                    )
         provenance_sets = {
-            tuple(report["provenance"].get(key) for key in provenance_keys)
-            for report in schema_v5_reports
+            tuple(report["provenance"][key] for key in provenance_keys)
+            for report in provenance_reports
         }
         profile_signatures = {
             json.dumps(report.get("profile"), sort_keys=True, separators=(",", ":"))
-            for report in schema_v5_reports
+            for report in provenance_reports
         }
         if len(provenance_sets) != 1 or len(profile_signatures) != 1:
             raise ValueError(
                 "qualification reports use different revisions, profiles, "
-                "or deadline configuration"
+                "or deadline/liveness configuration"
             )
         aggregate_reply_timeout = float(
-            schema_v5_reports[0]["provenance"]["reply_timeout_seconds"]
+            provenance_reports[0]["provenance"]["reply_timeout_seconds"]
         )
     else:
         aggregate_reply_timeout = READ_TIMEOUT
 
     runtime = sum(float(phase["actual_duration_seconds"]) for _, phase in phases)
-    session_fields = (
+    established_session_fields = (
         "explicit_requests",
         "expected_fc4_responses",
         "unmatched_fc4_observations",
@@ -573,10 +596,36 @@ def aggregate_qualification_reports(
         "observation_queue_drops",
         "connection_failures",
     )
+    liveness_session_fields = (
+        "tcp_keepalive_applied_connections",
+        "tcp_keepalive_idle_applied_connections",
+        "tcp_keepalive_configuration_failures",
+        "tcp_keepalive_configuration_unavailable",
+        "receive_inactivity_timeouts",
+    )
+    for report, phase in phases:
+        if int(report["schema_version"]) >= 6 and any(
+            field not in phase["session_metrics"]
+            for field in liveness_session_fields
+        ):
+            raise ValueError(
+                "schema-v6 qualification is missing required liveness metrics"
+            )
     session_totals = {
         field: sum(int(phase["session_metrics"][field]) for _, phase in phases)
-        for field in session_fields
+        for field in established_session_fields
     }
+    session_totals.update(
+        {
+            field: sum(
+                int(phase["session_metrics"][field])
+                if int(report["schema_version"]) >= 6
+                else int(phase["session_metrics"].get(field, 0))
+                for report, phase in phases
+            )
+            for field in liveness_session_fields
+        }
+    )
     recovery_fields = (
         "reconnect_attempts",
         "successful_reconnects",
@@ -613,7 +662,7 @@ def aggregate_qualification_reports(
         for _, phase in phases
     )
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "source_report_schema_version": (
             next(iter({int(report["schema_version"]) for report, _ in phases}))
             if len({int(report["schema_version"]) for report, _ in phases}) == 1
@@ -622,20 +671,35 @@ def aggregate_qualification_reports(
         "target_seconds": targets.pop(),
         "deadline_configuration": (
             {
-                "drain_timeout_seconds": schema_v5_reports[0]["provenance"][
+                "drain_timeout_seconds": provenance_reports[0]["provenance"][
                     "drain_timeout_seconds"
                 ],
                 "reply_timeout_seconds": aggregate_reply_timeout,
-                "split_request_deadlines": schema_v5_reports[0]["provenance"][
+                "split_request_deadlines": provenance_reports[0]["provenance"][
                     "split_request_deadlines"
                 ],
             }
-            if schema_v5_reports
+            if provenance_reports
             else {
                 "drain_timeout_seconds": READ_TIMEOUT,
                 "reply_timeout_seconds": READ_TIMEOUT,
                 "split_request_deadlines": False,
             }
+        ),
+        "liveness_configuration": (
+            {
+                "tcp_keepalive_enabled": provenance_reports[0]["provenance"].get(
+                    "tcp_keepalive_enabled"
+                ),
+                "tcp_keepalive_idle_seconds": provenance_reports[0][
+                    "provenance"
+                ].get("tcp_keepalive_idle_seconds"),
+                "receive_inactivity_timeout_seconds": provenance_reports[0][
+                    "provenance"
+                ].get("receive_inactivity_timeout_seconds"),
+            }
+            if report_schemas == {6}
+            else None
         ),
         "sustained_runs": len(phases),
         "total_runtime_seconds": round(runtime, 3),
@@ -855,6 +919,15 @@ async def execute_profile_validation(
             ),
             "split_request_deadlines": getattr(
                 client, "split_request_deadlines", False
+            ),
+            "tcp_keepalive_enabled": getattr(
+                client, "tcp_keepalive_enabled", True
+            ),
+            "tcp_keepalive_idle_seconds": getattr(
+                client, "tcp_keepalive_idle_seconds", 60
+            ),
+            "receive_inactivity_timeout_seconds": getattr(
+                client, "receive_inactivity_timeout_seconds", 900.0
             ),
         },
         "started_at": utc_now().isoformat(),

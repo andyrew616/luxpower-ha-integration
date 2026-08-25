@@ -344,6 +344,70 @@ def test_schema_v5_aggregation_rejects_mixed_deadline_provenance():
         aggregate_qualification_reports(reports)
 
 
+def test_schema_v6_aggregation_requires_matching_liveness_configuration():
+    reports = [
+        _qualification_report(
+            timeout=0,
+            reconnect=0,
+            target_met=True,
+            maximum=8.0,
+            values=[700.0] * 100,
+        )
+        for _ in range(2)
+    ]
+    for report in reports:
+        report["schema_version"] = 6
+        report["phases"][0]["session_metrics"].update(
+            {
+                "tcp_keepalive_applied_connections": 1,
+                "tcp_keepalive_idle_applied_connections": 1,
+                "tcp_keepalive_configuration_failures": 0,
+                "tcp_keepalive_configuration_unavailable": 0,
+                "receive_inactivity_timeouts": 0,
+            }
+        )
+        report["profile"] = {
+            "definition_version": 1,
+            "name": "energy_flow",
+            "required_registers": [0, 114],
+            "blocks": [{"start": 0, "count": 40}, {"start": 80, "count": 40}],
+        }
+        report["provenance"] = {
+            "implementation_revision": "a" * 40,
+            "profile_definition_version": 1,
+            "drain_timeout_seconds": 3,
+            "reply_timeout_seconds": 10,
+            "split_request_deadlines": True,
+            "tcp_keepalive_enabled": True,
+            "tcp_keepalive_idle_seconds": 60,
+            "receive_inactivity_timeout_seconds": 900.0,
+        }
+
+    aggregate = aggregate_qualification_reports(reports)
+    assert aggregate["schema_version"] == 2
+    assert aggregate["liveness_configuration"] == {
+        "tcp_keepalive_enabled": True,
+        "tcp_keepalive_idle_seconds": 60,
+        "receive_inactivity_timeout_seconds": 900.0,
+    }
+
+    reports[1]["provenance"]["receive_inactivity_timeout_seconds"] = None
+    with pytest.raises(ValueError, match="deadline/liveness configuration"):
+        aggregate_qualification_reports(reports)
+
+    reports[1]["provenance"]["receive_inactivity_timeout_seconds"] = 900.0
+    del reports[1]["provenance"]["tcp_keepalive_enabled"]
+    with pytest.raises(ValueError, match="missing required provenance"):
+        aggregate_qualification_reports(reports)
+
+    reports[1]["provenance"]["tcp_keepalive_enabled"] = True
+    del reports[1]["phases"][0]["session_metrics"][
+        "receive_inactivity_timeouts"
+    ]
+    with pytest.raises(ValueError, match="missing required liveness metrics"):
+        aggregate_qualification_reports(reports)
+
+
 def test_live_qualification_requires_both_phase_deadlines():
     _validate_deadline_options(None, None)
     _validate_deadline_options(3, 10)
@@ -517,18 +581,21 @@ async def test_short_only_schema_v5_provenance_and_intentional_shutdown_health()
         implementation_revision="a" * 40,
     )
 
-    assert report["schema_version"] == 5
-    assert report["validation_version"] == "5.0"
+    assert report["schema_version"] == 6
+    assert report["validation_version"] == "6.0"
     assert report["provenance"] == {
         "implementation_revision": "a" * 40,
         "revision_source": "operator_supplied",
         "profile_definition_version": 1,
-        "diagnostic_schema_version": 3,
+        "diagnostic_schema_version": 4,
         "run_mode": "critical_profile_timeout_diagnostics",
         "request_timeout_seconds": 3,
         "drain_timeout_seconds": 3,
         "reply_timeout_seconds": 3,
         "split_request_deadlines": False,
+        "tcp_keepalive_enabled": True,
+        "tcp_keepalive_idle_seconds": 60,
+        "receive_inactivity_timeout_seconds": 900.0,
     }
     assert [phase["name"] for phase in report["phases"]] == ["short_1"]
     assert report["phases"][0]["target_met"] is True

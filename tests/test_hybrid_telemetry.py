@@ -87,6 +87,21 @@ def test_freshness_target_must_remain_positive():
         client.set_freshness_target(timedelta(0))
 
 
+def test_hybrid_exposes_configured_read_session_liveness_policy():
+    client = LuxPowerHybridReadClient(
+        "192.0.2.1",
+        "TESTDONGLE",
+        "TESTINV001",
+        tcp_keepalive=False,
+        tcp_keepalive_idle_seconds=120,
+        receive_inactivity_timeout=None,
+    )
+
+    assert client.tcp_keepalive_enabled is False
+    assert client.tcp_keepalive_idle_seconds == 120
+    assert client.receive_inactivity_timeout_seconds is None
+
+
 class FakeSession:
     def __init__(self, fresh_blocks=()):
         now = utc_now()

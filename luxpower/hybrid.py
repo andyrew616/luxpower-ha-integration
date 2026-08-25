@@ -159,6 +159,9 @@ class LuxPowerHybridReadClient:
         profile: EnergyFlowReadProfile | None = None,
         session: LuxReadSession | None = None,
         recovery_policy: RecoveryPolicy | None = None,
+        tcp_keepalive: bool = True,
+        tcp_keepalive_idle_seconds: int = 60,
+        receive_inactivity_timeout: float | None = 900.0,
         monotonic=time.monotonic,
     ) -> None:
         if freshness_target.total_seconds() <= 0:
@@ -170,6 +173,9 @@ class LuxPowerHybridReadClient:
             dongle_serial,
             inverter_serial,
             port=port,
+            tcp_keepalive=tcp_keepalive,
+            tcp_keepalive_idle_seconds=tcp_keepalive_idle_seconds,
+            receive_inactivity_timeout=receive_inactivity_timeout,
         )
         self._freshness_target = freshness_target
         self._full_scan_interval = full_scan_interval
@@ -254,6 +260,21 @@ class LuxPowerHybridReadClient:
     def split_request_deadlines(self) -> bool:
         """Whether drain and reply phases use independent budgets."""
         return self._session.split_request_deadlines
+
+    @property
+    def tcp_keepalive_enabled(self) -> bool:
+        """Whether the session requests best-effort OS TCP keepalive."""
+        return self._session.tcp_keepalive_enabled
+
+    @property
+    def tcp_keepalive_idle_seconds(self) -> int:
+        """Requested idle time before OS TCP keepalive probing begins."""
+        return self._session.tcp_keepalive_idle_seconds
+
+    @property
+    def receive_inactivity_timeout_seconds(self) -> float | None:
+        """Configured application-byte inactivity deadline."""
+        return self._session.receive_inactivity_timeout_seconds
 
     @property
     def profile(self) -> EnergyFlowReadProfile | None:
@@ -1108,6 +1129,11 @@ def _metrics_delta(
         "connection_failures",
         "ambiguous_requests",
         "modbus_rejections",
+        "tcp_keepalive_applied_connections",
+        "tcp_keepalive_idle_applied_connections",
+        "tcp_keepalive_configuration_failures",
+        "tcp_keepalive_configuration_unavailable",
+        "receive_inactivity_timeouts",
     )
     delta = {name: getattr(after, name) - getattr(before, name) for name in fields}
     new_latency_count = (
