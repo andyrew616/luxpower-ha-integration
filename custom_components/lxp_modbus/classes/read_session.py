@@ -7,6 +7,7 @@ from contextlib import suppress
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
+from enum import Enum
 import time
 from typing import Awaitable, Callable, Mapping
 
@@ -58,6 +59,13 @@ class LuxReadObservation:
         return self.register_start + self.register_count - 1
 
 
+class LuxObservationSource(str, Enum):
+    """How the latest accepted value for one register was observed."""
+
+    EXPLICIT = "explicit"
+    UNSOLICITED = "unsolicited"
+
+
 @dataclass(frozen=True)
 class LuxReadSessionSnapshot:
     """Detached current input-register values and their observation times."""
@@ -66,6 +74,9 @@ class LuxReadSessionSnapshot:
     observed_at: LuxPowerObservationTimes = field(
         default_factory=LuxPowerObservationTimes,
     )
+    input_sources: Mapping[int, LuxObservationSource] = field(default_factory=dict)
+    explicit_observed_at: Mapping[int, datetime] = field(default_factory=dict)
+    unsolicited_observed_at: Mapping[int, datetime] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -156,6 +167,9 @@ class LuxReadSession:
 
         self._input_registers: dict[int, int] = {}
         self._input_observed_at: dict[int, datetime] = {}
+        self._input_sources: dict[int, LuxObservationSource] = {}
+        self._explicit_observed_at: dict[int, datetime] = {}
+        self._unsolicited_observed_at: dict[int, datetime] = {}
         self._last_block_values: dict[tuple[int, int], dict[int, int]] = {}
 
         self._connections = 0
@@ -346,6 +360,9 @@ class LuxReadSession:
             observed_at=LuxPowerObservationTimes(
                 input_registers=dict(self._input_observed_at)
             ),
+            input_sources=dict(self._input_sources),
+            explicit_observed_at=dict(self._explicit_observed_at),
+            unsolicited_observed_at=dict(self._unsolicited_observed_at),
         )
 
     def metrics(self) -> LuxReadSessionMetrics:
@@ -465,6 +482,16 @@ class LuxReadSession:
             self._invalid_frames += 1
             return
 
+        explicit = bool(
+            pending is not None
+            and response.register == pending.start
+            and count == pending.count
+        )
+        source = (
+            LuxObservationSource.EXPLICIT
+            if explicit
+            else LuxObservationSource.UNSOLICITED
+        )
         key = (response.register, count)
         duplicate = self._last_block_values.get(key) == values
         observed_at = require_aware_utc(self._clock())
@@ -472,16 +499,18 @@ class LuxReadSession:
         self._input_observed_at.update(
             {register: observed_at for register in values}
         )
+        self._input_sources.update({register: source for register in values})
+        source_times = (
+            self._explicit_observed_at
+            if explicit
+            else self._unsolicited_observed_at
+        )
+        source_times.update({register: observed_at for register in values})
         self._last_block_values[key] = dict(values)
         self._validated_fc4_frames += 1
         if duplicate:
             self._duplicate_fc4_frames += 1
 
-        explicit = bool(
-            pending is not None
-            and response.register == pending.start
-            and count == pending.count
-        )
         observation = LuxReadObservation(
             register_start=response.register,
             register_count=count,

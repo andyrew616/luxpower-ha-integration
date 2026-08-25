@@ -1,6 +1,7 @@
 """Tests for the standalone experimental hybrid telemetry facade."""
 
-from datetime import timedelta
+import asyncio
+from datetime import datetime, timedelta
 import os
 from pathlib import Path
 import subprocess
@@ -9,6 +10,7 @@ import sys
 import pytest
 
 from custom_components.lxp_modbus.classes.read_session import (
+    LuxObservationSource,
     LuxReadSession,
     LuxReadSessionMetrics,
 )
@@ -18,12 +20,27 @@ from custom_components.lxp_modbus.telemetry_groups import (
     TelemetryGroup,
     input_register_group,
 )
+from custom_components.lxp_modbus.read_profiles import (
+    EnergyFlowReadProfile,
+    GridTopology,
+    InputReadBlock,
+    LoadLayout,
+)
+from custom_components.lxp_modbus.exceptions import LuxPowerReadTimeoutError
 from luxpower.hybrid import (
     FULL_INPUT_READ_BLOCKS,
     OPERATIONAL_READ_BLOCKS,
     LuxPowerHybridReadClient,
     execute_live_validation,
 )
+
+
+def standard_profile():
+    return EnergyFlowReadProfile(
+        frozenset({1, 2, 3}),
+        GridTopology.SINGLE_PHASE,
+        LoadLayout.STANDARD,
+    )
 
 
 def test_hardware_proven_operational_and_full_read_plans():
@@ -67,16 +84,24 @@ class FakeSession:
         self.values = {}
         self.observed = {}
         self.reads = []
+        self.sources = {}
+        self.explicit_observed = {}
+        self.unsolicited_observed = {}
         for block in fresh_blocks:
             for register in block.addresses():
                 if input_register_group(register) is TelemetryGroup.OPERATIONAL:
                     self.values[register] = register
                     self.observed[register] = now
+                    self.sources[register] = LuxObservationSource.EXPLICIT
+                    self.explicit_observed[register] = now
 
     def snapshot(self):
         return LuxReadSessionSnapshot(
             input_registers=dict(self.values),
             observed_at=LuxPowerObservationTimes(input_registers=dict(self.observed)),
+            input_sources=dict(self.sources),
+            explicit_observed_at=dict(self.explicit_observed),
+            unsolicited_observed_at=dict(self.unsolicited_observed),
         )
 
     async def async_read_input(self, start, count):
@@ -85,6 +110,24 @@ class FakeSession:
         for register in range(start, start + count):
             self.values[register] = register
             self.observed[register] = now
+            self.sources[register] = LuxObservationSource.EXPLICIT
+            self.explicit_observed[register] = now
+
+    def observe_unsolicited(self, block):
+        now = utc_now()
+        for register in block.addresses():
+            self.values[register] = register
+            self.observed[register] = now
+            self.sources[register] = LuxObservationSource.UNSOLICITED
+            self.unsolicited_observed[register] = now
+
+    def observe_unsolicited_registers(self, registers):
+        now = utc_now()
+        for register in registers:
+            self.values[register] = register
+            self.observed[register] = now
+            self.sources[register] = LuxObservationSource.UNSOLICITED
+            self.unsolicited_observed[register] = now
 
 
 @pytest.mark.asyncio
@@ -103,6 +146,184 @@ async def test_hybrid_requests_only_blocks_with_stale_operational_values():
 
 
 @pytest.mark.asyncio
+async def test_profile_requests_only_blocks_with_stale_required_values():
+    profile = standard_profile()
+    session = FakeSession(fresh_blocks=(profile.read_blocks[0],))
+    client = LuxPowerHybridReadClient(
+        "192.0.2.1",
+        "TESTDONGLE",
+        "TESTINV001",
+        profile=profile,
+        session=session,
+    )
+
+    result = await client.async_refresh_profile()
+
+    assert result.fresh_blocks_skipped == (profile.read_blocks[0],)
+    assert session.reads == [(160, 40)]
+    assert client.profile_snapshot().required_registers == profile.required_registers
+
+
+@pytest.mark.asyncio
+async def test_unsolicited_profile_block_avoids_one_request_without_double_credit():
+    profile = standard_profile()
+    session = FakeSession()
+    session.observe_unsolicited(profile.read_blocks[0])
+    client = LuxPowerHybridReadClient(
+        "192.0.2.1",
+        "TESTDONGLE",
+        "TESTINV001",
+        profile=profile,
+        session=session,
+    )
+
+    first = await client.async_refresh_profile()
+    second = await client.async_refresh_profile()
+
+    assert first.blocks_satisfied_unsolicited == (profile.read_blocks[0],)
+    assert second.blocks_satisfied_unsolicited == ()
+    assert client.profile_metrics().explicit_requests_avoided_unsolicited == 1
+    assert client.profile_metrics().explicit_requests_attempted == 1
+
+
+@pytest.mark.asyncio
+async def test_unrelated_unsolicited_block_cannot_satisfy_profile_block():
+    profile = standard_profile()
+    session = FakeSession()
+    session.observe_unsolicited(InputReadBlock(40, 40))
+    client = LuxPowerHybridReadClient(
+        "192.0.2.1",
+        "TESTDONGLE",
+        "TESTINV001",
+        profile=profile,
+        session=session,
+    )
+
+    result = await client.async_refresh_profile()
+
+    assert result.blocks_satisfied_unsolicited == ()
+    assert session.reads == [(0, 40), (160, 40)]
+
+
+@pytest.mark.asyncio
+async def test_unsolicited_reception_does_not_claim_avoidance_before_read_was_due():
+    profile = standard_profile()
+    session = FakeSession(fresh_blocks=(profile.read_blocks[0],))
+    session.observe_unsolicited(profile.read_blocks[0])
+    client = LuxPowerHybridReadClient(
+        "192.0.2.1",
+        "TESTDONGLE",
+        "TESTINV001",
+        profile=profile,
+        session=session,
+    )
+
+    result = await client.async_refresh_profile()
+
+    assert result.blocks_satisfied_unsolicited == ()
+    assert client.profile_metrics().explicit_requests_avoided_unsolicited == 0
+
+
+@pytest.mark.asyncio
+async def test_consecutive_unsolicited_frames_credit_one_request_opportunity():
+    profile = standard_profile()
+    session = FakeSession(fresh_blocks=(profile.read_blocks[0],))
+    client = LuxPowerHybridReadClient(
+        "192.0.2.1",
+        "TESTDONGLE",
+        "TESTINV001",
+        freshness_target=timedelta(milliseconds=1),
+        profile=profile,
+        session=session,
+    )
+    await client.async_refresh_profile()
+    await asyncio.sleep(0.003)
+    session.observe_unsolicited(profile.read_blocks[0])
+    session.observe_unsolicited(profile.read_blocks[0])
+
+    await client.async_refresh_profile()
+    await client.async_refresh_profile()
+
+    assert client.profile_metrics().explicit_requests_avoided_unsolicited == 1
+
+
+@pytest.mark.asyncio
+async def test_mixed_source_refresh_credits_only_stale_register_displaced():
+    profile = standard_profile()
+    block = profile.read_blocks[0]
+    session = FakeSession(fresh_blocks=(block,))
+    oldest = min(profile.required_registers_in(block))
+    almost_due = utc_now() - timedelta(milliseconds=40)
+    session.observed[oldest] = almost_due
+    session.explicit_observed[oldest] = almost_due
+    client = LuxPowerHybridReadClient(
+        "192.0.2.1",
+        "TESTDONGLE",
+        "TESTINV001",
+        freshness_target=timedelta(milliseconds=50),
+        profile=profile,
+        session=session,
+    )
+    await client.async_refresh_profile()
+    await asyncio.sleep(0.015)
+    session.observe_unsolicited_registers((oldest,))
+
+    result = await client.async_refresh_profile()
+
+    assert result.blocks_satisfied_unsolicited == (block,)
+    assert client.profile_metrics().explicit_requests_avoided_unsolicited == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_profile_read_is_still_counted_as_an_attempt():
+    class TimeoutSession(FakeSession):
+        async def async_read_input(self, start, count):
+            self.reads.append((start, count))
+            raise LuxPowerReadTimeoutError("synthetic timeout")
+
+    profile = standard_profile()
+    client = LuxPowerHybridReadClient(
+        "192.0.2.1",
+        "TESTDONGLE",
+        "TESTINV001",
+        profile=profile,
+        session=TimeoutSession(),
+    )
+
+    with pytest.raises(LuxPowerReadTimeoutError):
+        await client.async_refresh_profile()
+
+    assert client.profile_metrics().explicit_requests_attempted == 1
+    assert client.last_profile_request_block == profile.read_blocks[0]
+
+
+@pytest.mark.asyncio
+async def test_profile_monitor_samples_through_final_in_flight_refresh():
+    class SlowSession(FakeSession):
+        async def async_read_input(self, start, count):
+            await asyncio.sleep(0.03)
+            await super().async_read_input(start, count)
+
+    profile = standard_profile()
+    client = LuxPowerHybridReadClient(
+        "192.0.2.1",
+        "TESTDONGLE",
+        "TESTINV001",
+        profile=profile,
+        session=SlowSession(),
+    )
+
+    samples = await client.async_run_profile(0.01, sample_interval=0.002)
+    elapsed = (
+        datetime.fromisoformat(samples[-1]["at"])
+        - datetime.fromisoformat(samples[0]["at"])
+    ).total_seconds()
+
+    assert elapsed >= 0.025
+    assert samples[-1]["profile_freshness"]["known"] > 0
+
+
+@pytest.mark.asyncio
 async def test_experimental_full_scan_uses_only_the_proven_aligned_plan():
     session = FakeSession()
     client = LuxPowerHybridReadClient(
@@ -114,6 +335,27 @@ async def test_experimental_full_scan_uses_only_the_proven_aligned_plan():
     assert session.reads == [
         (block.start, block.count) for block in FULL_INPUT_READ_BLOCKS
     ]
+
+
+@pytest.mark.asyncio
+async def test_full_scan_does_not_receive_unsolicited_avoidance_credit():
+    profile = standard_profile()
+    session = FakeSession()
+    client = LuxPowerHybridReadClient(
+        "192.0.2.1",
+        "TESTDONGLE",
+        "TESTINV001",
+        profile=profile,
+        session=session,
+    )
+
+    await client.async_full_scan()
+    result = await client.async_refresh_profile()
+
+    assert result.requested_blocks == ()
+    assert result.blocks_satisfied_unsolicited == ()
+    assert client.profile_metrics().explicit_requests_attempted == 0
+    assert client.profile_metrics().explicit_requests_avoided_unsolicited == 0
 
 
 @pytest.mark.asyncio

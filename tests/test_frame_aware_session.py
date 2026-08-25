@@ -9,7 +9,10 @@ import pytest
 from custom_components.lxp_modbus.classes.frame_decoder import LuxFrameDecoder
 from custom_components.lxp_modbus.classes.lxp_packet_utils import LxpPacketUtils
 from custom_components.lxp_modbus.classes.lxp_request_builder import LxpRequestBuilder
-from custom_components.lxp_modbus.classes.read_session import LuxReadSession
+from custom_components.lxp_modbus.classes.read_session import (
+    LuxObservationSource,
+    LuxReadSession,
+)
 from custom_components.lxp_modbus.exceptions import (
     LuxPowerCommunicationError,
     LuxPowerReadTimeoutError,
@@ -195,6 +198,11 @@ async def test_exact_response_and_unmatched_fc4_are_routed_independently():
     assert second.register_start == 160 and second.explicit_response is True
     assert session.metrics().unmatched_fc4_observations == 1
     assert session.metrics().expected_fc4_responses == 1
+    assert session.snapshot().input_sources[0] is LuxObservationSource.UNSOLICITED
+    assert session.snapshot().input_sources[160] is LuxObservationSource.EXPLICIT
+    detached_sources = session.snapshot().input_sources
+    detached_sources[0] = LuxObservationSource.EXPLICIT
+    assert session.snapshot().input_sources[0] is LuxObservationSource.UNSOLICITED
     assert session.snapshot().observed_at.input_registers[0] < (
         session.snapshot().observed_at.input_registers[160]
     )

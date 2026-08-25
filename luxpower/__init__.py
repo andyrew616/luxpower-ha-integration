@@ -21,10 +21,23 @@ from custom_components.lxp_modbus.exceptions import (
     LuxPowerSessionClosedError,
 )
 from custom_components.lxp_modbus.classes.read_session import (
+    LuxObservationSource,
     LuxReadObservation,
     LuxReadSession,
     LuxReadSessionMetrics,
     LuxReadSessionSnapshot,
+)
+from custom_components.lxp_modbus.read_profiles import (
+    EnergyFlowReadProfile,
+    EnergyFlowSnapshot,
+    GridTopology,
+    InputReadBlock,
+    LoadLayout,
+    ObservedProfileValue,
+    ProfileField,
+    ReadProfileName,
+    plan_aligned_input_blocks,
+    profile_block_details,
 )
 
 __all__ = [
@@ -34,6 +47,7 @@ __all__ = [
     "LuxPowerReadTimeoutError",
     "LuxPowerSessionClosedError",
     "LuxReadObservation",
+    "LuxObservationSource",
     "LuxReadSession",
     "LuxReadSessionMetrics",
     "LuxReadSessionSnapshot",
@@ -46,4 +60,14 @@ __all__ = [
     "holding_register_group",
     "input_register_group",
     "input_registers_for_group",
+    "EnergyFlowReadProfile",
+    "EnergyFlowSnapshot",
+    "GridTopology",
+    "InputReadBlock",
+    "LoadLayout",
+    "ObservedProfileValue",
+    "ProfileField",
+    "ReadProfileName",
+    "plan_aligned_input_blocks",
+    "profile_block_details",
 ]
