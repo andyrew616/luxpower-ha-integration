@@ -39,6 +39,7 @@ READ_INPUT_FUNCTION_CODE = 4
 MAX_READ_REGISTERS = 125
 _READER_CHUNK_SIZE = MAX_PACKET_SIZE
 _PARTIAL_FRAME_TIMEOUT = READ_TIMEOUT
+_REQUEST_LATENCY_HISTORY = 4096
 
 Connector = Callable[
     [str, int],
@@ -200,7 +201,10 @@ class LuxReadSession:
         self._operational_registers_expected = 0
         self._operational_registers_unmatched = 0
         self._observation_queue_drops = 0
-        self._request_latencies_ms: deque[float] = deque(maxlen=512)
+        # Bounded but large enough to retain an hour-scale qualification run.
+        self._request_latencies_ms: deque[float] = deque(
+            maxlen=_REQUEST_LATENCY_HISTORY
+        )
         self._request_latency_samples_total = 0
         self._decoder_discarded_total = 0
 
