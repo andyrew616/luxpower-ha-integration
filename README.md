@@ -71,7 +71,7 @@ the same packet builder, response parser, polling cadence, connection lifecycle,
 validation, recovery, retry, and cache implementation as the integration:
 
 ```python
-from luxpower import LuxPowerReadClient
+from luxpower import LuxPowerReadClient, TelemetryGroup
 
 client = LuxPowerReadClient(
     host="192.0.2.1",
@@ -80,10 +80,21 @@ client = LuxPowerReadClient(
     inverter_serial="0000000001",
 )
 telemetry = await client.async_read()
+pv_power_observed_at = telemetry.observed_at.input_registers.get(7)
+operational_values = telemetry.grouped_input_registers()[TelemetryGroup.OPERATIONAL]
 ```
 
 `telemetry` contains decoded input registers, holding registers, and any requested
-battery data. The standalone facade intentionally provides no write operation.
+battery data. Its `observed_at` sidecar contains timezone-aware UTC times for the
+last successful local observation of each raw value. Cached values retain their
+original observation time, and a missing time means this client has not observed
+that value. These are client observation times, not timestamps supplied by the
+inverter. Semantic register groups classify values without changing or promising
+any polling cadence; undocumented addresses remain explicitly `UNCLASSIFIED`.
+
+The API does not currently expose calculated values. A future calculated value
+that depends on multiple registers must not claim freshness newer than its oldest
+required input. The standalone facade intentionally provides no write operation.
 
 > [!WARNING]
 > ### Important Note on Read-Only Mode (Available since v0.1.5)
