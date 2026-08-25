@@ -16,11 +16,27 @@ from custom_components.lxp_modbus.telemetry_groups import (
 from custom_components.lxp_modbus.exceptions import (
     LuxPowerCommunicationError,
     LuxPowerError,
+    LuxPowerReadRejectedError,
+    LuxPowerReadTimeoutError,
+    LuxPowerSessionClosedError,
+)
+from custom_components.lxp_modbus.classes.read_session import (
+    LuxReadObservation,
+    LuxReadSession,
+    LuxReadSessionMetrics,
+    LuxReadSessionSnapshot,
 )
 
 __all__ = [
     "LuxPowerCommunicationError",
     "LuxPowerError",
+    "LuxPowerReadRejectedError",
+    "LuxPowerReadTimeoutError",
+    "LuxPowerSessionClosedError",
+    "LuxReadObservation",
+    "LuxReadSession",
+    "LuxReadSessionMetrics",
+    "LuxReadSessionSnapshot",
     "LuxPowerReadClient",
     "LuxPowerObservationTimes",
     "LuxPowerTelemetry",
