@@ -50,6 +50,16 @@ from custom_components.lxp_modbus.recovery import (
     RecoveryMetrics,
     RecoveryPolicy,
 )
+from custom_components.lxp_modbus.timeout_diagnostics import (
+    LuxDiagnosticEventKind,
+    LuxReadDiagnosticEvent,
+    LuxReadDiagnosticsSnapshot,
+    LuxReadPurpose,
+    LuxReadRequestContext,
+    LuxReadRequestDiagnostic,
+    LuxReadRequestOutcome,
+    LuxTimeoutDiagnosticEpisode,
+)
 
 __all__ = [
     "AcquisitionHealth",
@@ -67,6 +77,14 @@ __all__ = [
     "LuxReadSession",
     "LuxReadSessionMetrics",
     "LuxReadSessionSnapshot",
+    "LuxDiagnosticEventKind",
+    "LuxReadDiagnosticEvent",
+    "LuxReadDiagnosticsSnapshot",
+    "LuxReadPurpose",
+    "LuxReadRequestContext",
+    "LuxReadRequestDiagnostic",
+    "LuxReadRequestOutcome",
+    "LuxTimeoutDiagnosticEpisode",
     "LuxPowerReadClient",
     "LuxPowerObservationTimes",
     "LuxPowerTelemetry",

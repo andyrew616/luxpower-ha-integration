@@ -35,6 +35,7 @@ from custom_components.lxp_modbus.exceptions import (
     LuxPowerSessionClosedError,
 )
 from custom_components.lxp_modbus.recovery import AcquisitionHealth, RecoveryPolicy
+from custom_components.lxp_modbus.timeout_diagnostics import LuxReadPurpose
 from luxpower.hybrid import (
     FULL_INPUT_READ_BLOCKS,
     OPERATIONAL_READ_BLOCKS,
@@ -92,6 +93,7 @@ class FakeSession:
         self.values = {}
         self.observed = {}
         self.reads = []
+        self.contexts = []
         self.sources = {}
         self.explicit_observed = {}
         self.unsolicited_observed = {}
@@ -112,8 +114,9 @@ class FakeSession:
             unsolicited_observed_at=dict(self.unsolicited_observed),
         )
 
-    async def async_read_input(self, start, count):
+    async def async_read_input(self, start, count, *, context=None):
         self.reads.append((start, count))
+        self.contexts.append(context)
         now = utc_now()
         for register in range(start, start + count):
             self.values[register] = register
@@ -285,8 +288,9 @@ async def test_mixed_source_refresh_credits_only_stale_register_displaced():
 @pytest.mark.asyncio
 async def test_failed_profile_read_is_still_counted_as_an_attempt():
     class TimeoutSession(FakeSession):
-        async def async_read_input(self, start, count):
+        async def async_read_input(self, start, count, *, context=None):
             self.reads.append((start, count))
+            self.contexts.append(context)
             raise LuxPowerReadTimeoutError("synthetic timeout")
 
     profile = standard_profile()
@@ -308,9 +312,9 @@ async def test_failed_profile_read_is_still_counted_as_an_attempt():
 @pytest.mark.asyncio
 async def test_profile_monitor_samples_through_final_in_flight_refresh():
     class SlowSession(FakeSession):
-        async def async_read_input(self, start, count):
+        async def async_read_input(self, start, count, *, context=None):
             await asyncio.sleep(0.03)
-            await super().async_read_input(start, count)
+            await super().async_read_input(start, count, context=context)
 
     profile = standard_profile()
     client = LuxPowerHybridReadClient(
@@ -343,6 +347,10 @@ async def test_experimental_full_scan_uses_only_the_proven_aligned_plan():
     assert session.reads == [
         (block.start, block.count) for block in FULL_INPUT_READ_BLOCKS
     ]
+    assert all(
+        context.purpose is LuxReadPurpose.FULL_SCAN
+        for context in session.contexts
+    )
 
 
 @pytest.mark.asyncio
@@ -379,6 +387,10 @@ async def test_explicit_routing_probe_forces_all_six_operational_blocks():
     assert session.reads == [
         (block.start, block.count) for block in OPERATIONAL_READ_BLOCKS
     ]
+    assert all(
+        context.purpose is LuxReadPurpose.OPERATIONAL_PROBE
+        for context in session.contexts
+    )
 
 
 @pytest.mark.asyncio
@@ -447,8 +459,9 @@ class RecoverySession(FakeSession):
             else:
                 self.unsolicited_observed[register] = now
 
-    async def async_read_input(self, start, count):
+    async def async_read_input(self, start, count, *, context=None):
         self.reads.append((start, count))
+        self.contexts.append(context)
         if self.failures:
             failure = self.failures.pop(0)
             if failure is not None:
@@ -500,6 +513,10 @@ async def test_bounded_recovery_reacquires_only_stale_profile_block():
     result = await client.async_refresh_profile()
 
     assert session.reads == [(160, 40), (160, 40)]
+    assert [context.purpose for context in session.contexts] == [
+        LuxReadPurpose.NORMAL_PROFILE,
+        LuxReadPurpose.RECOVERY_REACQUISITION,
+    ]
     assert result.requested_blocks == (profile.read_blocks[1],)
     assert all(
         session.observed[register] == before[register]
@@ -671,10 +688,13 @@ async def test_shutdown_during_reacquisition_is_not_budget_exhaustion():
             self.retry_started = asyncio.Event()
             self.shutdown = asyncio.Event()
 
-        async def async_read_input(self, start, count):
+        async def async_read_input(self, start, count, *, context=None):
             if self.failures:
-                return await super().async_read_input(start, count)
+                return await super().async_read_input(
+                    start, count, context=context
+                )
             self.reads.append((start, count))
+            self.contexts.append(context)
             self.retry_started.set()
             await self.shutdown.wait()
             raise LuxPowerSessionClosedError("closed by test")
@@ -804,6 +824,11 @@ async def test_recovery_restarts_selection_and_reacquires_earlier_block_if_stale
     await client.async_refresh_profile()
 
     assert session.reads == [(160, 40), (0, 40), (160, 40)]
+    assert [context.purpose for context in session.contexts] == [
+        LuxReadPurpose.NORMAL_PROFILE,
+        LuxReadPurpose.RECOVERY_REACQUISITION,
+        LuxReadPurpose.RECOVERY_REACQUISITION,
+    ]
     assert client.acquisition_health is AcquisitionHealth.HEALTHY
     assert client.recovery_metrics().events[0].outcome == "profile_recovered"
 

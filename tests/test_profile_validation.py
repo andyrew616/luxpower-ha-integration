@@ -22,15 +22,23 @@ from custom_components.lxp_modbus.recovery import (
     RecoveryMetrics,
 )
 from custom_components.lxp_modbus.observation import utc_now
+from custom_components.lxp_modbus.timeout_diagnostics import (
+    LuxReadDiagnosticJournal,
+    LuxReadPurpose,
+    LuxReadRequestContext,
+    LuxReadRequestOutcome,
+)
 from luxpower.hybrid import HybridProfileMetrics
 
 from luxpower.profile_validation import (
+    _diagnostic_delta,
     _load_private_target,
     _nearest_rank_p95,
     _nearest_rank_p99,
     _time_beyond_target,
     _time_beyond_target_by_health_state,
     _time_beyond_target_by_recovery_episode,
+    _verify_live_source_revision,
     _violation_episode_summary,
     _write_private_report,
     aggregate_qualification_reports,
@@ -278,6 +286,62 @@ def test_private_report_permissions(tmp_path):
     assert output.stat().st_mode & 0o777 == 0o600
 
 
+def test_diagnostic_delta_reports_block_purpose_and_traffic_correlation():
+    journal = LuxReadDiagnosticJournal(event_capacity=64, request_capacity=16)
+    before = journal.snapshot()
+    connection_opened = journal.now()
+
+    normal = journal.begin_request(
+        generation=1,
+        register_start=0,
+        register_count=40,
+        timeout_seconds=3,
+        context=LuxReadRequestContext(
+            purpose=LuxReadPurpose.NORMAL_PROFILE,
+            profile_worst_age_seconds=8,
+            profile_health="healthy",
+        ),
+        connection_opened_monotonic=connection_opened,
+        requests_previously_on_generation=0,
+    )
+    journal.observe_matched(normal, 0, 40)
+    journal.finalize_request(normal, LuxReadRequestOutcome.SUCCESS)
+
+    recovery = journal.begin_request(
+        generation=2,
+        register_start=80,
+        register_count=40,
+        timeout_seconds=3,
+        context=LuxReadRequestContext(
+            purpose=LuxReadPurpose.RECOVERY_REACQUISITION,
+            profile_worst_age_seconds=12,
+            profile_health="recovering",
+        ),
+        connection_opened_monotonic=journal.now(),
+        requests_previously_on_generation=0,
+    )
+    journal.observe_unmatched(2, 0, 40, recovery)
+    journal.observe_fc193(2, recovery)
+    journal.mark_generation_invalidated(recovery)
+    journal.finalize_request(recovery, LuxReadRequestOutcome.RESPONSE_TIMEOUT)
+
+    delta = _diagnostic_delta(before, journal.snapshot())
+
+    assert delta["request_history_complete"] is True
+    assert delta["analysis"]["by_block"]["0-39"]["successes"] == 1
+    assert delta["analysis"]["by_block"]["80-119"]["timeouts"] == 1
+    assert (
+        delta["analysis"]["by_purpose"]["recovery_reacquisition"]["timeouts"]
+        == 1
+    )
+    traffic = delta["analysis"]["traffic_near_timeouts"]
+    assert traffic["unmatched_fc4_while_pending"] == 1
+    assert traffic["fc193_while_pending"] == 1
+    assert traffic["invalid_frames_while_pending"] == 0
+    assert delta["analysis"]["late_old_generation_response"]["detected"] is None
+    assert len(delta["timeout_episodes"]) == 1
+
+
 def _zero_session_metrics():
     return LuxReadSessionMetrics(
         connections=1,
@@ -304,7 +368,7 @@ def _zero_session_metrics():
 
 
 @pytest.mark.asyncio
-async def test_short_only_schema_v3_and_intentional_shutdown_health():
+async def test_short_only_schema_v4_provenance_and_intentional_shutdown_health():
     class QualificationClient:
         def __init__(self):
             self.profile = EnergyFlowReadProfile(
@@ -375,14 +439,24 @@ async def test_short_only_schema_v3_and_intentional_shutdown_health():
         short_seconds=0.01,
         burn_seconds=0,
         forced_samples=1,
+        implementation_revision="a" * 40,
     )
 
-    assert report["schema_version"] == 3
-    assert report["validation_version"] == "3.1"
+    assert report["schema_version"] == 4
+    assert report["validation_version"] == "4.0"
+    assert report["provenance"] == {
+        "implementation_revision": "a" * 40,
+        "revision_source": "operator_supplied",
+        "profile_definition_version": 1,
+        "diagnostic_schema_version": 1,
+        "run_mode": "critical_profile_timeout_diagnostics",
+        "request_timeout_seconds": 3,
+    }
     assert [phase["name"] for phase in report["phases"]] == ["short_1"]
     assert report["phases"][0]["target_met"] is True
     assert report["forced_profile_refresh"]["target_seconds"] == 10.0
     assert report["forced_profile_refresh"]["five_second_interval_consumed_percent"] is None
+    assert report["forced_profile_refresh"]["request_diagnostics"]["available"] is False
     assert report["terminal_shutdown"] == {
         "intentional": True,
         "operational_health_before_shutdown": "healthy",
@@ -407,6 +481,28 @@ def test_private_target_loader_returns_values_without_serializing_them():
     }
     serialized = json.dumps(public_report)
     assert not any(value in serialized for value in private.values())
+
+
+def test_live_revision_requires_matching_clean_checkout(monkeypatch, tmp_path):
+    expected = "a" * 40
+
+    def clean_run(command, **_kwargs):
+        output = expected + "\n" if "rev-parse" in command else ""
+        return SimpleNamespace(returncode=0, stdout=output)
+
+    monkeypatch.setattr(subprocess, "run", clean_run)
+    assert (
+        _verify_live_source_revision(expected, repository_root=tmp_path)
+        == expected
+    )
+
+    def dirty_run(command, **_kwargs):
+        output = expected + "\n" if "rev-parse" in command else " M source.py\n"
+        return SimpleNamespace(returncode=0, stdout=output)
+
+    monkeypatch.setattr(subprocess, "run", dirty_run)
+    with pytest.raises(ValueError, match="clean Git checkout"):
+        _verify_live_source_revision(expected, repository_root=tmp_path)
 
 
 def test_profile_validation_cli_requires_explicit_read_only_confirmation(tmp_path):

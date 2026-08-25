@@ -28,6 +28,14 @@ from ..observation import (
     utc_now,
 )
 from ..telemetry_groups import TelemetryGroup, input_register_group
+from ..timeout_diagnostics import (
+    LuxDiagnosticEventKind,
+    LuxReadDiagnosticJournal,
+    LuxReadDiagnosticsSnapshot,
+    LuxReadRequestContext,
+    LuxReadRequestOutcome,
+    _DiagnosticRequestState,
+)
 from .data_validator import is_data_sane
 from .connection_manager import CONNECTION_TIMEOUT
 from .frame_decoder import LuxFrameDecoder
@@ -120,6 +128,7 @@ class _PendingRead:
     generation: int
     sent_monotonic: float
     future: asyncio.Future[LuxReadObservation]
+    diagnostic: _DiagnosticRequestState
 
 
 class LuxReadSession:
@@ -141,6 +150,10 @@ class LuxReadSession:
         clock: ObservationClock = utc_now,
         monotonic: Callable[[], float] = time.monotonic,
         request_timeout: float = READ_TIMEOUT,
+        diagnostic_monotonic: Callable[[], float] = time.monotonic,
+        diagnostic_event_capacity: int = 512,
+        diagnostic_request_capacity: int = 4096,
+        diagnostic_failure_capacity: int = 64,
     ) -> None:
         if not host:
             raise ValueError("host is required")
@@ -161,6 +174,12 @@ class LuxReadSession:
         self._clock = clock
         self._monotonic = monotonic
         self._request_timeout = request_timeout
+        self._diagnostics = LuxReadDiagnosticJournal(
+            monotonic=diagnostic_monotonic,
+            event_capacity=diagnostic_event_capacity,
+            request_capacity=diagnostic_request_capacity,
+            failure_capacity=diagnostic_failure_capacity,
+        )
 
         self._lifecycle_lock = asyncio.Lock()
         self._request_lock = asyncio.Lock()
@@ -168,9 +187,12 @@ class LuxReadSession:
         self._writer: asyncio.StreamWriter | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._generation = 0
+        self._active_connection_generation: int | None = None
         self._decoder = LuxFrameDecoder()
         self._pending: _PendingRead | None = None
         self._connection_lost = False
+        self._connection_opened_diagnostic_monotonic = self._diagnostics.now()
+        self._requests_on_generation = 0
         self._observations: asyncio.Queue[LuxReadObservation] = asyncio.Queue(
             maxsize=1024
         )
@@ -217,6 +239,11 @@ class LuxReadSession:
             and not self._reader_task.done()
         )
 
+    @property
+    def request_timeout_seconds(self) -> float:
+        """Configured combined drain/response deadline for explicit FC4 reads."""
+        return self._request_timeout
+
     async def async_connect(self) -> None:
         """Connect and immediately start the sole socket reader."""
         async with self._lifecycle_lock:
@@ -227,9 +254,21 @@ class LuxReadSession:
         async with self._lifecycle_lock:
             task = self._reader_task
             writer = self._writer
+            closing_generation = self._active_connection_generation
+            close_event_generation = (
+                closing_generation
+                if closing_generation is not None
+                else self._generation
+            )
+            if task is not None or writer is not None:
+                self._diagnostics.record_event(
+                    LuxDiagnosticEventKind.CLOSE_STARTED,
+                    close_event_generation,
+                )
             self._reader_task = None
             self._reader = None
             self._writer = None
+            self._active_connection_generation = None
             self._connection_lost = False
             self._generation += 1
             self._fail_pending(LuxPowerSessionClosedError("read session closed"))
@@ -246,6 +285,11 @@ class LuxReadSession:
             if decoder_stats.buffered_bytes:
                 self._invalid_frames += 1
             self._decoder.reset()
+            if task is not None or writer is not None:
+                self._diagnostics.record_event(
+                    LuxDiagnosticEventKind.CLOSE_COMPLETED,
+                    close_event_generation,
+                )
 
     async def async_reconnect(self, *, delay: float = 0) -> None:
         """Start a clean connection generation after an optional bounded delay."""
@@ -286,8 +330,16 @@ class LuxReadSession:
         self._decoder = decoder
         self._reader = reader
         self._writer = writer
+        self._active_connection_generation = generation
         self._connection_lost = False
         self._connections += 1
+        self._connection_opened_diagnostic_monotonic = self._diagnostics.now()
+        self._requests_on_generation = 0
+        self._diagnostics.record_event(
+            LuxDiagnosticEventKind.CONNECTION_OPENED,
+            generation,
+            at=self._connection_opened_diagnostic_monotonic,
+        )
         self._reader_task = asyncio.create_task(
             self._reader_loop(generation, reader, decoder),
             name=f"lux-fc4-reader-{generation}",
@@ -299,6 +351,7 @@ class LuxReadSession:
         register_count: int,
         *,
         timeout: float | None = None,
+        context: LuxReadRequestContext | None = None,
     ) -> LuxReadObservation:
         """Issue one FC4 read and await only its exactly correlated response."""
         self._validate_read_range(start_register, register_count)
@@ -325,12 +378,25 @@ class LuxReadSession:
             )
             self._assert_read_only_packet(packet, start_register, register_count)
             future = asyncio.get_running_loop().create_future()
+            diagnostic = self._diagnostics.begin_request(
+                generation=self._generation,
+                register_start=start_register,
+                register_count=register_count,
+                timeout_seconds=response_timeout,
+                context=context or LuxReadRequestContext(),
+                connection_opened_monotonic=(
+                    self._connection_opened_diagnostic_monotonic
+                ),
+                requests_previously_on_generation=self._requests_on_generation,
+            )
+            self._requests_on_generation += 1
             pending = _PendingRead(
                 start=start_register,
                 count=register_count,
                 generation=self._generation,
                 sent_monotonic=self._monotonic(),
                 future=future,
+                diagnostic=diagnostic,
             )
             self._pending = pending
             self._explicit_requests += 1
@@ -338,27 +404,44 @@ class LuxReadSession:
             loop = asyncio.get_running_loop()
             deadline = loop.time() + response_timeout
             drain_completed = False
+            outcome: LuxReadRequestOutcome | None = None
             try:
                 self._writer.write(packet)
+                self._diagnostics.mark_write_returned(diagnostic)
                 await asyncio.wait_for(
                     self._writer.drain(), timeout=max(0, deadline - loop.time())
                 )
                 drain_completed = True
-                return await asyncio.wait_for(
+                self._diagnostics.mark_drain_completed(diagnostic)
+                observation = await asyncio.wait_for(
                     asyncio.shield(future), timeout=max(0, deadline - loop.time())
                 )
+                outcome = LuxReadRequestOutcome.SUCCESS
+                return observation
             except asyncio.TimeoutError as exc:
+                # The timeout callback has already fired; this samples only the
+                # state observed when the handler runs after rescheduling.
+                diagnostic.future_done_when_timeout_handled = future.done()
+                self._diagnostics.record_event(
+                    LuxDiagnosticEventKind.DEADLINE_EXPIRED,
+                    pending.generation,
+                    request=diagnostic,
+                    register_start=start_register,
+                    register_count=register_count,
+                )
                 if self._pending is pending:
                     self._pending = None
                 if not future.done():
                     future.cancel()
                 if drain_completed:
                     self._request_timeouts += 1
+                    outcome = LuxReadRequestOutcome.RESPONSE_TIMEOUT
                 else:
                     self._ambiguous_requests += 1
+                    outcome = LuxReadRequestOutcome.AMBIGUOUS_DRAIN_TIMEOUT
                 # FC4 has no transaction identifier. A late response on this
                 # generation could otherwise satisfy a later same-range request.
-                self._taint_current_generation()
+                self._taint_current_generation(diagnostic)
                 await self.async_close()
                 if drain_completed:
                     raise LuxPowerReadTimeoutError(
@@ -369,36 +452,54 @@ class LuxReadSession:
                     "FC4 request drain timed out ambiguously"
                 ) from exc
             except asyncio.CancelledError:
+                outcome = LuxReadRequestOutcome.CANCELLED
                 if self._pending is pending:
                     self._pending = None
                 if not future.done():
                     future.cancel()
-                self._taint_current_generation()
+                self._taint_current_generation(diagnostic)
                 await self.async_close()
                 raise
             except (ConnectionError, OSError) as exc:
+                outcome = LuxReadRequestOutcome.AMBIGUOUS_IO_FAILURE
                 if self._pending is pending:
                     self._pending = None
                 if not future.done():
                     future.cancel()
                 self._ambiguous_requests += 1
-                self._taint_current_generation()
+                self._taint_current_generation(diagnostic)
                 await self.async_close()
                 raise LuxPowerAmbiguousRequestError(
                     "FC4 request failed ambiguously"
                 ) from exc
-            except (LuxPowerReadRejectedError, LuxPowerCommunicationError):
+            except LuxPowerReadRejectedError:
+                outcome = LuxReadRequestOutcome.MODBUS_REJECTED
+                raise
+            except LuxPowerConnectionLostError:
+                outcome = LuxReadRequestOutcome.CONNECTION_LOST
+                raise
+            except LuxPowerSessionClosedError:
+                outcome = LuxReadRequestOutcome.SESSION_CLOSED
+                raise
+            except LuxPowerCommunicationError:
+                outcome = LuxReadRequestOutcome.COMMUNICATION_FAILURE
                 raise
             except Exception as exc:
+                outcome = LuxReadRequestOutcome.AMBIGUOUS_IO_FAILURE
                 if self._pending is pending:
                     self._pending = None
                 if not future.done():
                     future.cancel()
-                self._taint_current_generation()
+                self._taint_current_generation(diagnostic)
                 await self.async_close()
                 raise LuxPowerAmbiguousRequestError(
                     "FC4 request ended ambiguously"
                 ) from exc
+            finally:
+                self._diagnostics.finalize_request(
+                    diagnostic,
+                    outcome or LuxReadRequestOutcome.COMMUNICATION_FAILURE,
+                )
 
     async def async_next_observation(
         self, *, timeout: float | None = None
@@ -461,6 +562,10 @@ class LuxReadSession:
             modbus_rejections=self._modbus_rejections,
         )
 
+    def diagnostics(self) -> LuxReadDiagnosticsSnapshot:
+        """Return detached sanitized request and event diagnostics."""
+        return self._diagnostics.snapshot()
+
     async def _reader_loop(
         self,
         generation: int,
@@ -481,6 +586,10 @@ class LuxReadSession:
                             return
                         if decoder.discard_partial():
                             self._invalid_frames += 1
+                            self._diagnostics.observe_invalid(
+                                generation,
+                                self._pending_diagnostic(generation),
+                            )
                         continue
                 else:
                     chunk = await reader.read(_READER_CHUNK_SIZE)
@@ -495,6 +604,11 @@ class LuxReadSession:
                 frames = decoder.feed(chunk)
                 malformed_after = decoder.stats().malformed_lengths
                 self._invalid_frames += malformed_after - malformed_before
+                for _ in range(malformed_after - malformed_before):
+                    self._diagnostics.observe_invalid(
+                        generation,
+                        self._pending_diagnostic(generation),
+                    )
                 for frame in frames:
                     self._route_frame(frame, generation)
         except asyncio.CancelledError:
@@ -502,6 +616,10 @@ class LuxReadSession:
         except Exception as exc:  # reader failure must release every waiter
             error = exc
         finally:
+            self._diagnostics.record_event(
+                LuxDiagnosticEventKind.READER_EXIT,
+                generation,
+            )
             if generation == self._generation and error is not None:
                 await self._reader_failed(generation, error)
 
@@ -514,6 +632,10 @@ class LuxReadSession:
         if not response.packet_error and response.tcp_function == 193:
             # Integrity and semantics are not established; diagnostics only.
             self._function_193_frames += 1
+            self._diagnostics.observe_fc193(
+                generation,
+                self._pending_diagnostic(generation),
+            )
             return
 
         targeted = bool(
@@ -533,6 +655,13 @@ class LuxReadSession:
         ):
             self._pending = None
             self._modbus_rejections += 1
+            self._diagnostics.record_event(
+                LuxDiagnosticEventKind.MODBUS_REJECTED,
+                generation,
+                request=pending.diagnostic,
+                register_start=response.register,
+                register_count=pending.count,
+            )
             if not pending.future.done():
                 pending.future.set_exception(
                     LuxPowerReadRejectedError(
@@ -562,6 +691,10 @@ class LuxReadSession:
             and is_data_sane(values, "input")
         ):
             self._invalid_frames += 1
+            self._diagnostics.observe_invalid(
+                generation,
+                self._pending_diagnostic(generation),
+            )
             return
 
         explicit = bool(
@@ -604,6 +737,11 @@ class LuxReadSession:
         self._publish_observation(observation)
 
         if explicit and pending is not None:
+            self._diagnostics.observe_matched(
+                pending.diagnostic,
+                response.register,
+                count,
+            )
             self._pending = None
             self._expected_fc4_responses += 1
             self._request_latencies_ms.append(
@@ -617,6 +755,12 @@ class LuxReadSession:
                 for register in values
             )
         else:
+            self._diagnostics.observe_unmatched(
+                generation,
+                response.register,
+                count,
+                self._pending_diagnostic(generation),
+            )
             self._unmatched_fc4_observations += 1
             self._operational_registers_unmatched += sum(
                 input_register_group(register) is TelemetryGroup.OPERATIONAL
@@ -634,9 +778,15 @@ class LuxReadSession:
         async with self._lifecycle_lock:
             if generation != self._generation:
                 return
+            self._diagnostics.record_event(
+                LuxDiagnosticEventKind.CONNECTION_LOST,
+                generation,
+                request=self._pending_diagnostic(generation),
+            )
             writer = self._writer
             self._reader = None
             self._writer = None
+            self._active_connection_generation = None
             self._reader_task = None
             self._generation += 1
             self._connection_lost = True
@@ -655,11 +805,30 @@ class LuxReadSession:
         pending = self._pending
         self._pending = None
         if pending is not None and not pending.future.done():
+            self._diagnostics.record_event(
+                LuxDiagnosticEventKind.PENDING_FAILED,
+                pending.generation,
+                request=pending.diagnostic,
+                register_start=pending.start,
+                register_count=pending.count,
+            )
             pending.future.set_exception(error)
 
-    def _taint_current_generation(self) -> None:
+    def _taint_current_generation(
+        self, diagnostic: _DiagnosticRequestState | None = None
+    ) -> None:
         """Synchronously reject all further bytes before cleanup can await."""
+        if diagnostic is not None:
+            self._diagnostics.mark_generation_invalidated(diagnostic)
         self._generation += 1
+
+    def _pending_diagnostic(
+        self, generation: int
+    ) -> _DiagnosticRequestState | None:
+        pending = self._pending
+        if pending is None or pending.generation != generation:
+            return None
+        return pending.diagnostic
 
     @staticmethod
     async def _close_writer(writer: asyncio.StreamWriter | None) -> None:
