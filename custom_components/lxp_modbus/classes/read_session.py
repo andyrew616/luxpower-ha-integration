@@ -150,6 +150,8 @@ class LuxReadSession:
         clock: ObservationClock = utc_now,
         monotonic: Callable[[], float] = time.monotonic,
         request_timeout: float = READ_TIMEOUT,
+        drain_timeout: float | None = None,
+        reply_timeout: float | None = None,
         diagnostic_monotonic: Callable[[], float] = time.monotonic,
         diagnostic_event_capacity: int = 512,
         diagnostic_request_capacity: int = 4096,
@@ -165,6 +167,10 @@ class LuxReadSession:
             raise ValueError("inverter_serial must be exactly 10 bytes")
         if request_timeout <= 0:
             raise ValueError("request_timeout must be positive")
+        if drain_timeout is not None and drain_timeout <= 0:
+            raise ValueError("drain_timeout must be positive")
+        if reply_timeout is not None and reply_timeout <= 0:
+            raise ValueError("reply_timeout must be positive")
 
         self._host = host
         self._port = port
@@ -174,6 +180,17 @@ class LuxReadSession:
         self._clock = clock
         self._monotonic = monotonic
         self._request_timeout = request_timeout
+        self._drain_timeout = (
+            request_timeout if drain_timeout is None else drain_timeout
+        )
+        self._reply_timeout = (
+            request_timeout if reply_timeout is None else reply_timeout
+        )
+        # Preserve the historic combined deadline unless a caller explicitly
+        # opts into independently timed drain and reply phases.
+        self._split_request_deadlines = (
+            drain_timeout is not None or reply_timeout is not None
+        )
         self._diagnostics = LuxReadDiagnosticJournal(
             monotonic=diagnostic_monotonic,
             event_capacity=diagnostic_event_capacity,
@@ -241,8 +258,23 @@ class LuxReadSession:
 
     @property
     def request_timeout_seconds(self) -> float:
-        """Configured combined drain/response deadline for explicit FC4 reads."""
+        """Historic combined deadline, retained for backwards compatibility."""
         return self._request_timeout
+
+    @property
+    def drain_timeout_seconds(self) -> float:
+        """Maximum time allowed for an explicit request's writer drain."""
+        return self._drain_timeout
+
+    @property
+    def reply_timeout_seconds(self) -> float:
+        """Maximum time allowed for a reply after a successful writer drain."""
+        return self._reply_timeout
+
+    @property
+    def split_request_deadlines(self) -> bool:
+        """Whether drain and reply phases use independent timeout budgets."""
+        return self._split_request_deadlines
 
     async def async_connect(self) -> None:
         """Connect and immediately start the sole socket reader."""
@@ -351,13 +383,41 @@ class LuxReadSession:
         register_count: int,
         *,
         timeout: float | None = None,
+        drain_timeout: float | None = None,
+        reply_timeout: float | None = None,
         context: LuxReadRequestContext | None = None,
     ) -> LuxReadObservation:
         """Issue one FC4 read and await only its exactly correlated response."""
         self._validate_read_range(start_register, register_count)
-        response_timeout = self._request_timeout if timeout is None else timeout
-        if response_timeout <= 0:
+        if timeout is not None and (
+            drain_timeout is not None or reply_timeout is not None
+        ):
+            raise ValueError(
+                "timeout cannot be combined with drain_timeout or reply_timeout"
+            )
+        if timeout is not None and timeout <= 0:
             raise ValueError("timeout must be positive")
+        if drain_timeout is not None and drain_timeout <= 0:
+            raise ValueError("drain_timeout must be positive")
+        if reply_timeout is not None and reply_timeout <= 0:
+            raise ValueError("reply_timeout must be positive")
+
+        if timeout is not None:
+            effective_drain_timeout = timeout
+            effective_reply_timeout = timeout
+            split_deadlines = False
+        else:
+            effective_drain_timeout = (
+                self._drain_timeout if drain_timeout is None else drain_timeout
+            )
+            effective_reply_timeout = (
+                self._reply_timeout if reply_timeout is None else reply_timeout
+            )
+            split_deadlines = (
+                self._split_request_deadlines
+                or drain_timeout is not None
+                or reply_timeout is not None
+            )
 
         async with self._request_lock:
             if not self.connected or self._writer is None:
@@ -382,7 +442,12 @@ class LuxReadSession:
                 generation=self._generation,
                 register_start=start_register,
                 register_count=register_count,
-                timeout_seconds=response_timeout,
+                timeout_seconds=(
+                    effective_reply_timeout if not split_deadlines else None
+                ),
+                drain_timeout_seconds=effective_drain_timeout,
+                reply_timeout_seconds=effective_reply_timeout,
+                split_deadlines=split_deadlines,
                 context=context or LuxReadRequestContext(),
                 connection_opened_monotonic=(
                     self._connection_opened_diagnostic_monotonic
@@ -402,19 +467,33 @@ class LuxReadSession:
             self._explicit_requests += 1
 
             loop = asyncio.get_running_loop()
-            deadline = loop.time() + response_timeout
+            combined_deadline = (
+                None
+                if split_deadlines
+                else loop.time() + effective_reply_timeout
+            )
             drain_completed = False
             outcome: LuxReadRequestOutcome | None = None
             try:
                 self._writer.write(packet)
                 self._diagnostics.mark_write_returned(diagnostic)
+                drain_budget = (
+                    effective_drain_timeout
+                    if combined_deadline is None
+                    else max(0, combined_deadline - loop.time())
+                )
                 await asyncio.wait_for(
-                    self._writer.drain(), timeout=max(0, deadline - loop.time())
+                    self._writer.drain(), timeout=drain_budget
                 )
                 drain_completed = True
                 self._diagnostics.mark_drain_completed(diagnostic)
+                reply_budget = (
+                    effective_reply_timeout
+                    if combined_deadline is None
+                    else max(0, combined_deadline - loop.time())
+                )
                 observation = await asyncio.wait_for(
-                    asyncio.shield(future), timeout=max(0, deadline - loop.time())
+                    asyncio.shield(future), timeout=reply_budget
                 )
                 outcome = LuxReadRequestOutcome.SUCCESS
                 return observation
@@ -423,7 +502,11 @@ class LuxReadSession:
                 # state observed when the handler runs after rescheduling.
                 diagnostic.future_done_when_timeout_handled = future.done()
                 self._diagnostics.record_event(
-                    LuxDiagnosticEventKind.DEADLINE_EXPIRED,
+                    (
+                        LuxDiagnosticEventKind.REPLY_DEADLINE_EXPIRED
+                        if drain_completed
+                        else LuxDiagnosticEventKind.DRAIN_DEADLINE_EXPIRED
+                    ),
                     pending.generation,
                     request=diagnostic,
                     register_start=start_register,

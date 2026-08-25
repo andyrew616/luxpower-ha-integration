@@ -110,6 +110,11 @@ async def test_timeout_episode_captures_other_pending_traffic_without_values():
     diagnostics = session.diagnostics()
     request = diagnostics.requests[-1]
     assert request.outcome is LuxReadRequestOutcome.RESPONSE_TIMEOUT
+    assert request.timeout_budget_ms == 20
+    assert request.drain_timeout_budget_ms == 20
+    assert request.reply_timeout_budget_ms == 20
+    assert request.split_deadlines is False
+    assert request.reply_wait_duration_ms is None
     assert request.unmatched_fc4_while_pending == 1
     assert request.fc193_while_pending == 1
     assert request.invalid_frames_while_pending == 0
@@ -186,3 +191,26 @@ async def test_diagnostics_exclude_private_target_and_raw_packet_data():
     assert "packet" not in serialized.lower()
     assert "values" not in serialized.lower()
     await session.async_close()
+
+
+def test_diagnostic_records_independent_phase_budgets():
+    journal = LuxReadDiagnosticJournal()
+    state = journal.begin_request(
+        generation=1,
+        register_start=0,
+        register_count=40,
+        drain_timeout_seconds=1,
+        reply_timeout_seconds=10,
+        split_deadlines=True,
+        context=LuxReadRequestContext(),
+        connection_opened_monotonic=journal.now(),
+        requests_previously_on_generation=0,
+    )
+
+    request = journal.finalize_request(state, LuxReadRequestOutcome.SUCCESS)
+
+    assert journal.snapshot().schema_version == 2
+    assert request.timeout_budget_ms == 10000
+    assert request.drain_timeout_budget_ms == 1000
+    assert request.reply_timeout_budget_ms == 10000
+    assert request.split_deadlines is True

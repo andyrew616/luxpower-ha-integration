@@ -48,6 +48,8 @@ class LuxDiagnosticEventKind(str, Enum):
     MODBUS_REJECTED = "modbus_rejected"
     PENDING_FAILED = "pending_failed"
     DEADLINE_EXPIRED = "deadline_expired"
+    DRAIN_DEADLINE_EXPIRED = "drain_deadline_expired"
+    REPLY_DEADLINE_EXPIRED = "reply_deadline_expired"
     GENERATION_TAINTED = "generation_tainted"
     CLOSE_STARTED = "close_started"
     CLOSE_COMPLETED = "close_completed"
@@ -104,9 +106,13 @@ class LuxReadRequestDiagnostic:
     profile_worst_age_seconds: float | None
     profile_health: str | None
     timeout_budget_ms: float
+    drain_timeout_budget_ms: float
+    reply_timeout_budget_ms: float
+    split_deadlines: bool
     write_returned: bool
     drain_completed: bool
     drain_duration_ms: float | None
+    reply_wait_duration_ms: float | None
     matching_response_routed: bool
     matched_before_drain_completion_observed: bool
     accepted_response_latency_ms: float | None
@@ -168,6 +174,9 @@ class _DiagnosticRequestState:
     register_start: int
     register_count: int
     timeout_budget_ms: float
+    drain_timeout_budget_ms: float
+    reply_timeout_budget_ms: float
+    split_deadlines: bool
     started_monotonic: float
     started_relative: float
     previous_request_elapsed: float | None
@@ -180,7 +189,9 @@ class _DiagnosticRequestState:
     write_returned: bool = False
     drain_started_monotonic: float | None = None
     drain_completed: bool = False
+    drain_completed_monotonic: float | None = None
     drain_duration_ms: float | None = None
+    reply_wait_duration_ms: float | None = None
     matching_response_routed: bool = False
     matched_before_drain_completion_observed: bool = False
     accepted_response_latency_ms: float | None = None
@@ -195,7 +206,7 @@ class _DiagnosticRequestState:
 class LuxReadDiagnosticJournal:
     """Non-blocking bounded journal which never stores packets or register values."""
 
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 2
 
     def __init__(
         self,
@@ -275,11 +286,43 @@ class LuxReadDiagnosticJournal:
         generation: int,
         register_start: int,
         register_count: int,
-        timeout_seconds: float,
+        timeout_seconds: float | None = None,
+        drain_timeout_seconds: float | None = None,
+        reply_timeout_seconds: float | None = None,
+        split_deadlines: bool = False,
         context: LuxReadRequestContext,
         connection_opened_monotonic: float,
         requests_previously_on_generation: int,
     ) -> _DiagnosticRequestState:
+        if timeout_seconds is None and (
+            drain_timeout_seconds is None or reply_timeout_seconds is None
+        ):
+            raise ValueError(
+                "timeout_seconds or both phase timeout values are required"
+            )
+        legacy_timeout = timeout_seconds
+        effective_drain_timeout = (
+            legacy_timeout
+            if drain_timeout_seconds is None
+            else drain_timeout_seconds
+        )
+        effective_reply_timeout = (
+            legacy_timeout
+            if reply_timeout_seconds is None
+            else reply_timeout_seconds
+        )
+        if (
+            effective_drain_timeout is None
+            or effective_reply_timeout is None
+            or effective_drain_timeout <= 0
+            or effective_reply_timeout <= 0
+        ):
+            raise ValueError("diagnostic timeout budgets must be positive")
+        compatibility_timeout = (
+            legacy_timeout
+            if legacy_timeout is not None
+            else effective_reply_timeout
+        )
         now = self.now()
         request_sequence = self._next_request_sequence
         self._next_request_sequence += 1
@@ -289,7 +332,10 @@ class LuxReadDiagnosticJournal:
             context=context,
             register_start=register_start,
             register_count=register_count,
-            timeout_budget_ms=timeout_seconds * 1000,
+            timeout_budget_ms=compatibility_timeout * 1000,
+            drain_timeout_budget_ms=effective_drain_timeout * 1000,
+            reply_timeout_budget_ms=effective_reply_timeout * 1000,
+            split_deadlines=split_deadlines,
             started_monotonic=now,
             started_relative=round(now - self._origin, 6),
             previous_request_elapsed=self._elapsed(now, self._last_request_started),
@@ -331,6 +377,7 @@ class LuxReadDiagnosticJournal:
     def mark_drain_completed(self, state: _DiagnosticRequestState) -> None:
         now = self.now()
         state.drain_completed = True
+        state.drain_completed_monotonic = now
         if state.drain_started_monotonic is not None:
             state.drain_duration_ms = (
                 now - state.drain_started_monotonic
@@ -358,6 +405,11 @@ class LuxReadDiagnosticJournal:
         state.accepted_response_latency_ms = (
             now - state.started_monotonic
         ) * 1000
+        state.reply_wait_duration_ms = (
+            0.0
+            if state.drain_completed_monotonic is None
+            else (now - state.drain_completed_monotonic) * 1000
+        )
         self._last_accepted_response = now
         self.record_event(
             LuxDiagnosticEventKind.MATCHED_FC4,
@@ -472,9 +524,19 @@ class LuxReadDiagnosticJournal:
             ),
             profile_health=state.context.profile_health,
             timeout_budget_ms=round(state.timeout_budget_ms, 3),
+            drain_timeout_budget_ms=round(
+                state.drain_timeout_budget_ms, 3
+            ),
+            reply_timeout_budget_ms=round(
+                state.reply_timeout_budget_ms, 3
+            ),
+            split_deadlines=state.split_deadlines,
             write_returned=state.write_returned,
             drain_completed=state.drain_completed,
             drain_duration_ms=self._rounded(state.drain_duration_ms, digits=3),
+            reply_wait_duration_ms=self._rounded(
+                state.reply_wait_duration_ms, digits=3
+            ),
             matching_response_routed=state.matching_response_routed,
             matched_before_drain_completion_observed=(
                 state.matched_before_drain_completion_observed

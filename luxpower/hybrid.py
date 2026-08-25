@@ -237,8 +237,23 @@ class LuxPowerHybridReadClient:
 
     @property
     def request_timeout_seconds(self) -> float:
-        """Actual combined drain/response deadline used by the read session."""
+        """Historic combined deadline retained for compatible consumers."""
         return self._session.request_timeout_seconds
+
+    @property
+    def drain_timeout_seconds(self) -> float:
+        """Configured socket-drain deadline for explicit FC4 reads."""
+        return self._session.drain_timeout_seconds
+
+    @property
+    def reply_timeout_seconds(self) -> float:
+        """Configured correlated-reply deadline for explicit FC4 reads."""
+        return self._session.reply_timeout_seconds
+
+    @property
+    def split_request_deadlines(self) -> bool:
+        """Whether drain and reply phases use independent budgets."""
+        return self._session.split_request_deadlines
 
     @property
     def profile(self) -> EnergyFlowReadProfile | None:
@@ -993,11 +1008,16 @@ def _nearest_rank(values: Sequence[float], percentile: float) -> float | None:
     return ordered[max(0, math.ceil(len(ordered) * percentile) - 1)]
 
 
-def _latency_summary(latencies: Sequence[float], *, samples_total: int) -> dict:
+def _latency_summary(
+    latencies: Sequence[float],
+    *,
+    samples_total: int,
+    reply_timeout_seconds: float | None = READ_TIMEOUT,
+) -> dict:
     """Return a sanitized exact distribution for retained accepted responses."""
     values = tuple(float(value) for value in latencies)
     truncated = samples_total > len(values)
-    thresholds_ms = (1000, 1500, 2000, 2500)
+    thresholds_ms = (1000, 1500, 2000, 2500, 3000, 5000, 10000)
     above = {
         str(threshold): {
             "count": sum(value > threshold for value in values),
@@ -1009,7 +1029,7 @@ def _latency_summary(latencies: Sequence[float], *, samples_total: int) -> dict:
         }
         for threshold in thresholds_ms
     }
-    histogram_limits = (500, 750, 1000, 1500, 2000, 2500, 3000)
+    histogram_limits = (500, 750, 1000, 1500, 2000, 2500, 3000, 5000, 10000)
     histogram: dict[str, int] = {}
     lower = 0
     for upper in histogram_limits:
@@ -1017,8 +1037,19 @@ def _latency_summary(latencies: Sequence[float], *, samples_total: int) -> dict:
             lower < value <= upper for value in values
         )
         lower = upper
-    histogram[">3000"] = sum(value > 3000 for value in values)
+    histogram[">10000"] = sum(value > 10000 for value in values)
     maximum = max(values) if values else None
+    decision_buckets = {
+        "0-3000": sum(0 <= value <= 3000 for value in values),
+        ">3000-5000": sum(3000 < value <= 5000 for value in values),
+        ">5000-10000": sum(5000 < value <= 10000 for value in values),
+        ">10000": sum(value > 10000 for value in values),
+        "beyond_reply_timeout": (
+            sum(value > reply_timeout_seconds * 1000 for value in values)
+            if reply_timeout_seconds is not None
+            else None
+        ),
+    }
     return {
         "samples": len(values),
         "samples_total": samples_total,
@@ -1038,18 +1069,25 @@ def _latency_summary(latencies: Sequence[float], *, samples_total: int) -> dict:
         "min": round(min(values), 3) if values and not truncated else None,
         "max": round(maximum, 3) if maximum is not None and not truncated else None,
         "successful_max_margin_to_timeout_ms": (
-            round(READ_TIMEOUT * 1000 - maximum, 3)
-            if maximum is not None and not truncated
+            round(reply_timeout_seconds * 1000 - maximum, 3)
+            if maximum is not None
+            and not truncated
+            and reply_timeout_seconds is not None
             else None
         ),
+        "reply_timeout_seconds": reply_timeout_seconds,
         "above_threshold_ms": above if not truncated else None,
+        "decision_buckets_ms": decision_buckets if not truncated else None,
         "histogram_ms": histogram if not truncated else None,
         "values_ms": [round(value, 3) for value in values],
     }
 
 
 def _metrics_delta(
-    before: LuxReadSessionMetrics, after: LuxReadSessionMetrics
+    before: LuxReadSessionMetrics,
+    after: LuxReadSessionMetrics,
+    *,
+    reply_timeout_seconds: float | None = READ_TIMEOUT,
 ) -> dict:
     fields = (
         "bytes_received",
@@ -1081,7 +1119,9 @@ def _metrics_delta(
         if new_latency_count else ()
     )
     delta["request_latency_ms"] = _latency_summary(
-        latencies, samples_total=new_latency_count
+        latencies,
+        samples_total=new_latency_count,
+        reply_timeout_seconds=reply_timeout_seconds,
     )
     return delta
 

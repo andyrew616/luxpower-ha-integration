@@ -499,6 +499,176 @@ async def test_drain_timeout_is_ambiguous_not_response_timeout():
 
 
 @pytest.mark.asyncio
+async def test_split_deadlines_keep_a_short_drain_budget_with_long_reply_window():
+    reader = QueueReader()
+
+    class SlowDrainWriter(FakeWriter):
+        async def drain(self):
+            await asyncio.Event().wait()
+
+    session = make_session(
+        reader,
+        SlowDrainWriter(),
+        drain_timeout=0.01,
+        reply_timeout=0.1,
+    )
+    await session.async_connect()
+
+    with pytest.raises(LuxPowerAmbiguousRequestError):
+        await session.async_read_input(0, 40)
+
+    request = session.diagnostics().requests[-1]
+    assert request.outcome.value == "ambiguous_drain_timeout"
+    assert request.drain_timeout_budget_ms == 10
+    assert request.reply_timeout_budget_ms == 100
+    assert request.split_deadlines is True
+    assert session.metrics().request_timeouts == 0
+    assert any(
+        event.kind.value == "drain_deadline_expired"
+        for event in session.diagnostics().events
+    )
+
+
+@pytest.mark.asyncio
+async def test_split_reply_window_starts_after_successful_drain():
+    reader = QueueReader()
+
+    class DelayedDrainWriter(FakeWriter):
+        async def drain(self):
+            await asyncio.sleep(0.02)
+
+    writer = DelayedDrainWriter()
+    session = make_session(
+        reader,
+        writer,
+        drain_timeout=0.03,
+        reply_timeout=0.03,
+    )
+    writer.on_write = lambda _packet: asyncio.get_running_loop().call_later(
+        0.04, reader.feed, input_response(0)
+    )
+    await session.async_connect()
+
+    result = await session.async_read_input(0, 40)
+
+    assert result.register_start == 0
+    request = session.diagnostics().requests[-1]
+    assert request.outcome.value == "success"
+    assert request.drain_completed is True
+    assert request.split_deadlines is True
+    assert request.accepted_response_latency_ms >= 30
+    assert request.reply_wait_duration_ms is not None
+    assert request.reply_wait_duration_ms >= 10
+    await session.async_close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_timeout_remains_one_combined_drain_and_reply_budget():
+    reader = QueueReader()
+
+    class DelayedDrainWriter(FakeWriter):
+        async def drain(self):
+            await asyncio.sleep(0.02)
+
+    writer = DelayedDrainWriter()
+    session = make_session(reader, writer, request_timeout=0.03)
+    writer.on_write = lambda _packet: asyncio.get_running_loop().call_later(
+        0.04, reader.feed, input_response(0)
+    )
+    await session.async_connect()
+
+    with pytest.raises(LuxPowerReadTimeoutError):
+        await session.async_read_input(0, 40)
+
+    request = session.diagnostics().requests[-1]
+    assert request.outcome.value == "response_timeout"
+    assert request.split_deadlines is False
+    assert request.drain_timeout_budget_ms == 30
+    assert request.reply_timeout_budget_ms == 30
+    assert request.generation_invalidated is True
+
+
+@pytest.mark.asyncio
+async def test_split_reply_timeout_preserves_generation_taint():
+    reader = QueueReader()
+    session = make_session(
+        reader,
+        FakeWriter(),
+        drain_timeout=0.01,
+        reply_timeout=0.02,
+    )
+    await session.async_connect()
+
+    with pytest.raises(LuxPowerReadTimeoutError):
+        await session.async_read_input(0, 40)
+
+    request = session.diagnostics().requests[-1]
+    assert request.outcome.value == "response_timeout"
+    assert request.split_deadlines is True
+    assert request.generation_invalidated is True
+    assert session.connected is False
+    assert any(
+        event.kind.value == "reply_deadline_expired"
+        for event in session.diagnostics().events
+    )
+
+
+@pytest.mark.asyncio
+async def test_split_deadline_configuration_is_additive_and_validated():
+    reader = QueueReader()
+    session = make_session(
+        reader,
+        FakeWriter(),
+        request_timeout=3,
+        drain_timeout=1,
+        reply_timeout=10,
+    )
+
+    assert session.request_timeout_seconds == 3
+    assert session.drain_timeout_seconds == 1
+    assert session.reply_timeout_seconds == 10
+    assert session.split_request_deadlines is True
+
+    with pytest.raises(ValueError, match="cannot be combined"):
+        await session.async_read_input(
+            0,
+            40,
+            timeout=3,
+            reply_timeout=10,
+        )
+
+
+@pytest.mark.asyncio
+async def test_per_call_legacy_timeout_restores_combined_budget_on_split_session():
+    reader = QueueReader()
+
+    class DelayedDrainWriter(FakeWriter):
+        async def drain(self):
+            await asyncio.sleep(0.02)
+
+    writer = DelayedDrainWriter()
+    session = make_session(
+        reader,
+        writer,
+        drain_timeout=0.03,
+        reply_timeout=0.1,
+    )
+    writer.on_write = lambda _packet: asyncio.get_running_loop().call_later(
+        0.04, reader.feed, input_response(0)
+    )
+    await session.async_connect()
+
+    with pytest.raises(LuxPowerReadTimeoutError):
+        await session.async_read_input(0, 40, timeout=0.03)
+
+    request = session.diagnostics().requests[-1]
+    assert request.split_deadlines is False
+    assert request.timeout_budget_ms == 30
+    assert request.drain_timeout_budget_ms == 30
+    assert request.reply_timeout_budget_ms == 30
+
+
+@pytest.mark.asyncio
 async def test_idle_eof_is_classified_on_next_acquisition():
     reader = QueueReader()
     session = make_session(reader, FakeWriter())

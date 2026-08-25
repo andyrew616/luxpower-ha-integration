@@ -17,6 +17,7 @@ import sys
 import time
 from typing import Mapping, Sequence
 
+from custom_components.lxp_modbus.classes.read_session import LuxReadSession
 from custom_components.lxp_modbus.const import READ_TIMEOUT
 from custom_components.lxp_modbus.exceptions import LuxPowerCommunicationError
 from custom_components.lxp_modbus.observation import utc_now
@@ -41,8 +42,8 @@ from luxpower.hybrid import (
     _metrics_delta,
 )
 
-PROFILE_VALIDATION_SCHEMA_VERSION = 4
-PROFILE_VALIDATION_VERSION = "4.0"
+PROFILE_VALIDATION_SCHEMA_VERSION = 5
+PROFILE_VALIDATION_VERSION = "5.0"
 
 
 def _maximum_age(freshness: Mapping[str, object]) -> float | None:
@@ -302,6 +303,12 @@ def _request_group_summary(
         for request in requests
         if request.outcome is LuxReadRequestOutcome.RESPONSE_TIMEOUT
     ]
+    reply_budgets = {
+        request.reply_timeout_budget_ms / 1000 for request in requests
+    }
+    reply_timeout_seconds = (
+        next(iter(reply_budgets)) if len(reply_budgets) == 1 else None
+    )
     return {
         "attempts": attempts,
         "successes": len(successes),
@@ -321,6 +328,7 @@ def _request_group_summary(
                 if request.accepted_response_latency_ms is not None
             ],
             samples_total=len(successes),
+            reply_timeout_seconds=reply_timeout_seconds,
         ),
         "request_start_spacing_seconds": _numeric_summary(
             [request.time_since_previous_request_start_seconds for request in requests]
@@ -505,8 +513,10 @@ def aggregate_qualification_reports(
     """Aggregate sanitized sustained phases without inferring long-term rates."""
     phases: list[tuple[Mapping[str, object], Mapping[str, object]]] = []
     for report in reports:
-        if int(report.get("schema_version", 0)) not in (3, 4):
-            raise ValueError("qualification aggregation requires schema-v3/v4 reports")
+        if int(report.get("schema_version", 0)) not in (3, 4, 5):
+            raise ValueError(
+                "qualification aggregation requires schema-v3/v4/v5 reports"
+            )
         phases.extend(
             (report, phase)
             for phase in report.get("phases", [])
@@ -517,6 +527,39 @@ def aggregate_qualification_reports(
     targets = {float(phase["target_seconds"]) for _, phase in phases}
     if len(targets) != 1:
         raise ValueError("qualification reports use different freshness targets")
+    schema_v5_reports = [
+        report for report in reports if int(report.get("schema_version", 0)) == 5
+    ]
+    if schema_v5_reports:
+        if len(schema_v5_reports) != len(reports):
+            raise ValueError(
+                "schema-v5 qualification cannot aggregate with older schemas"
+            )
+        provenance_keys = (
+            "implementation_revision",
+            "profile_definition_version",
+            "drain_timeout_seconds",
+            "reply_timeout_seconds",
+            "split_request_deadlines",
+        )
+        provenance_sets = {
+            tuple(report["provenance"].get(key) for key in provenance_keys)
+            for report in schema_v5_reports
+        }
+        profile_signatures = {
+            json.dumps(report.get("profile"), sort_keys=True, separators=(",", ":"))
+            for report in schema_v5_reports
+        }
+        if len(provenance_sets) != 1 or len(profile_signatures) != 1:
+            raise ValueError(
+                "qualification reports use different revisions, profiles, "
+                "or deadline configuration"
+            )
+        aggregate_reply_timeout = float(
+            schema_v5_reports[0]["provenance"]["reply_timeout_seconds"]
+        )
+    else:
+        aggregate_reply_timeout = READ_TIMEOUT
 
     runtime = sum(float(phase["actual_duration_seconds"]) for _, phase in phases)
     session_fields = (
@@ -577,6 +620,23 @@ def aggregate_qualification_reports(
             else sorted({int(report["schema_version"]) for report, _ in phases})
         ),
         "target_seconds": targets.pop(),
+        "deadline_configuration": (
+            {
+                "drain_timeout_seconds": schema_v5_reports[0]["provenance"][
+                    "drain_timeout_seconds"
+                ],
+                "reply_timeout_seconds": aggregate_reply_timeout,
+                "split_request_deadlines": schema_v5_reports[0]["provenance"][
+                    "split_request_deadlines"
+                ],
+            }
+            if schema_v5_reports
+            else {
+                "drain_timeout_seconds": READ_TIMEOUT,
+                "reply_timeout_seconds": READ_TIMEOUT,
+                "split_request_deadlines": False,
+            }
+        ),
         "sustained_runs": len(phases),
         "total_runtime_seconds": round(runtime, 3),
         "total_runtime_hours": round(runtime / 3600, 6),
@@ -599,7 +659,9 @@ def aggregate_qualification_reports(
             "reconnects_per_hour": round(reconnects * 3600 / runtime, 6),
         },
         "request_latency_ms": _latency_summary(
-            latency_values, samples_total=latency_samples_total
+            latency_values,
+            samples_total=latency_samples_total,
+            reply_timeout_seconds=aggregate_reply_timeout,
         ),
         "freshness": {
             "strict_target_met": all(bool(phase["target_met"]) for _, phase in phases),
@@ -645,7 +707,13 @@ async def _run_profile_phase(
     after_profile = client.profile_metrics()
     after_recovery = client.recovery_metrics()
     after_diagnostics = _client_diagnostics(client)
-    session_delta = _metrics_delta(before_session, after_session)
+    session_delta = _metrics_delta(
+        before_session,
+        after_session,
+        reply_timeout_seconds=getattr(
+            client, "reply_timeout_seconds", READ_TIMEOUT
+        ),
+    )
     attempted = (
         after_profile.explicit_requests_attempted
         - before_profile.explicit_requests_attempted
@@ -778,6 +846,15 @@ async def execute_profile_validation(
             "run_mode": "critical_profile_timeout_diagnostics",
             "request_timeout_seconds": getattr(
                 client, "request_timeout_seconds", READ_TIMEOUT
+            ),
+            "drain_timeout_seconds": getattr(
+                client, "drain_timeout_seconds", READ_TIMEOUT
+            ),
+            "reply_timeout_seconds": getattr(
+                client, "reply_timeout_seconds", READ_TIMEOUT
+            ),
+            "split_request_deadlines": getattr(
+                client, "split_request_deadlines", False
             ),
         },
         "started_at": utc_now().isoformat(),
@@ -952,6 +1029,17 @@ def _parse_implementation_revision(value: str) -> str:
     return value
 
 
+def _validate_deadline_options(
+    drain_timeout_seconds: float | None,
+    reply_timeout_seconds: float | None,
+) -> None:
+    """Require an explicit, fully attributable split for live qualification."""
+    if (drain_timeout_seconds is None) != (reply_timeout_seconds is None):
+        raise ValueError(
+            "drain and reply timeout options must be supplied together"
+        )
+
+
 def _verify_live_source_revision(
     expected_revision: str | None,
     *,
@@ -1015,6 +1103,22 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--short-seconds", type=float, default=30)
     parser.add_argument("--burn-seconds", type=float, default=180)
     parser.add_argument("--forced-samples", type=int, default=5)
+    parser.add_argument(
+        "--drain-timeout-seconds",
+        type=float,
+        help=(
+            "experimental independent writer-drain deadline; requires "
+            "--reply-timeout-seconds"
+        ),
+    )
+    parser.add_argument(
+        "--reply-timeout-seconds",
+        type=float,
+        help=(
+            "experimental independent correlated-reply deadline; requires "
+            "--drain-timeout-seconds"
+        ),
+    )
     parser.add_argument("--enable-recovery", action="store_true")
     parser.add_argument("--recovery-window-seconds", type=float, default=300)
     parser.add_argument("--recovery-window-attempts", type=int, default=2)
@@ -1047,12 +1151,25 @@ async def _async_main(arguments: argparse.Namespace) -> int:
         if arguments.enable_recovery
         else None
     )
+    _validate_deadline_options(
+        arguments.drain_timeout_seconds,
+        arguments.reply_timeout_seconds,
+    )
+    session = LuxReadSession(
+        host,
+        dongle,
+        inverter,
+        port=port,
+        drain_timeout=arguments.drain_timeout_seconds,
+        reply_timeout=arguments.reply_timeout_seconds,
+    )
     client = LuxPowerHybridReadClient(
         host,
         dongle,
         inverter,
         port=port,
         profile=profile,
+        session=session,
         recovery_policy=recovery_policy,
     )
     report = await execute_profile_validation(
