@@ -124,6 +124,18 @@ def make_session(reader, writer, **kwargs):
     )
 
 
+def test_request_latency_history_covers_a_sixty_minute_qualification():
+    session = make_session(QueueReader(), FakeWriter())
+    session._request_latencies_ms.extend(float(index) for index in range(600))
+    session._request_latency_samples_total = 600
+
+    metrics = session.metrics()
+
+    assert metrics.request_latency_samples_total == 600
+    assert len(metrics.request_latencies_ms) == 600
+    assert metrics.request_latencies_ms[0] == 0.0
+
+
 def test_decoder_assembles_byte_fragmentation_and_retains_leftovers():
     first = input_response(0)
     second = input_response(40)

@@ -60,6 +60,9 @@ class RecoveryEvent:
     failure_to_profile_recovery_seconds: float | None
     maximum_profile_age_seconds: float | None
     outcome: str
+    recovery_started_at: str | None = None
+    reconnect_started_at: str | None = None
+    connection_established_at: str | None = None
 
 
 @dataclass(frozen=True)

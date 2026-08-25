@@ -24,10 +24,20 @@ from custom_components.lxp_modbus.read_profiles import (
     profile_block_details,
 )
 from custom_components.lxp_modbus.recovery import RecoveryPolicy
-from luxpower.hybrid import LuxPowerHybridReadClient, _metrics_delta
+from luxpower.hybrid import (
+    LuxPowerHybridReadClient,
+    _latency_summary,
+    _metrics_delta,
+)
 
 PROFILE_VALIDATION_SCHEMA_VERSION = 3
-PROFILE_VALIDATION_VERSION = "3.0"
+PROFILE_VALIDATION_VERSION = "3.1"
+
+
+def _maximum_age(freshness: Mapping[str, object]) -> float | None:
+    """Use unrounded age for decisions, with schema-v3 compatibility fallback."""
+    value = freshness.get("max_age_seconds_raw", freshness["max_age_seconds"])
+    return float(value) if value is not None else None
 
 
 def _nearest_rank_p95(values: Sequence[float]) -> float | None:
@@ -53,7 +63,8 @@ def summarize_profile_samples(samples: Sequence[Mapping[str, object]]) -> dict:
         for item in freshness
         if item["known"] == item["required"] and item["max_age_seconds"] is not None
     ]
-    ages = [float(item["max_age_seconds"]) for item in complete]
+    ages = [_maximum_age(item) for item in complete]
+    ages = [age for age in ages if age is not None]
     outliers: dict[str, int] = {}
     for item in complete:
         register = str(item["worst_register"])
@@ -77,9 +88,9 @@ def _time_beyond_target(
     for current, following in zip(samples, samples[1:]):
         freshness = current["profile_freshness"]
         stale = bool(
-            freshness["max_age_seconds"] is None
+            _maximum_age(freshness) is None
             or freshness["known"] != freshness["required"]
-            or freshness["max_age_seconds"] > target_seconds
+            or _maximum_age(freshness) > target_seconds
         )
         if stale:
             total += (
@@ -97,9 +108,9 @@ def _time_beyond_target_by_health_state(
     for current, following in zip(samples, samples[1:]):
         freshness = current["profile_freshness"]
         stale = bool(
-            freshness["max_age_seconds"] is None
+            _maximum_age(freshness) is None
             or freshness["known"] != freshness["required"]
-            or freshness["max_age_seconds"] > target_seconds
+            or _maximum_age(freshness) > target_seconds
         )
         if not stale:
             continue
@@ -132,9 +143,9 @@ def _time_beyond_target_by_recovery_episode(
     for current, following in zip(samples, samples[1:]):
         freshness = current["profile_freshness"]
         stale = bool(
-            freshness["max_age_seconds"] is None
+            _maximum_age(freshness) is None
             or freshness["known"] != freshness["required"]
-            or freshness["max_age_seconds"] > target_seconds
+            or _maximum_age(freshness) > target_seconds
         )
         if not stale:
             continue
@@ -148,6 +159,86 @@ def _time_beyond_target_by_recovery_episode(
             datetime.fromisoformat(str(following["at"])) - started
         ).total_seconds()
     return {name: round(value, 3) for name, value in totals.items()}
+
+
+def _violation_episode_summary(
+    samples: Sequence[Mapping[str, object]],
+    target_seconds: float,
+    recovery_events: Sequence[Mapping[str, object]],
+) -> dict:
+    """Describe contiguous sampled SLA violations without omitting recovery."""
+    recovery_ranges = tuple(
+        (
+            datetime.fromisoformat(str(event["episode_started_at"])),
+            datetime.fromisoformat(str(event["ended_at"])),
+            getattr(event["failure_kind"], "value", str(event["failure_kind"])),
+        )
+        for event in recovery_events
+    )
+    episodes: list[dict] = []
+    active: dict | None = None
+    intervals = []
+    for current, following in zip(samples, samples[1:]):
+        started = datetime.fromisoformat(str(current["at"]))
+        ended = datetime.fromisoformat(str(following["at"]))
+        intervals.append((ended - started).total_seconds())
+        freshness = current["profile_freshness"]
+        stale = bool(
+            _maximum_age(freshness) is None
+            or freshness["known"] != freshness["required"]
+            or _maximum_age(freshness) > target_seconds
+        )
+        if stale:
+            age = _maximum_age(freshness)
+            if active is None:
+                active = {
+                    "started_at": started,
+                    "ended_at": ended,
+                    "duration_seconds": 0.0,
+                    "maximum_age_seconds": float(age) if age is not None else None,
+                }
+            active["ended_at"] = ended
+            active["duration_seconds"] += (ended - started).total_seconds()
+            if age is not None:
+                active["maximum_age_seconds"] = max(
+                    active["maximum_age_seconds"] or float(age), float(age)
+                )
+            continue
+        if active is not None:
+            episodes.append(active)
+            active = None
+    if active is not None:
+        episodes.append(active)
+
+    serialized = []
+    for episode in episodes:
+        causes = sorted({
+            failure_kind
+            for recovery_start, recovery_end, failure_kind in recovery_ranges
+            if recovery_start <= episode["ended_at"]
+            and recovery_end >= episode["started_at"]
+        })
+        serialized.append({
+            "started_at": episode["started_at"].isoformat(),
+            "ended_at": episode["ended_at"].isoformat(),
+            "duration_seconds": round(episode["duration_seconds"], 3),
+            "maximum_age_seconds": (
+                round(episode["maximum_age_seconds"], 3)
+                if episode["maximum_age_seconds"] is not None
+                else None
+            ),
+            "cause": causes or ["undetermined_non_recovery"],
+        })
+    durations = [episode["duration_seconds"] for episode in serialized]
+    return {
+        "count": len(serialized),
+        "longest_duration_seconds": round(max(durations), 3) if durations else 0.0,
+        "sampling_interval_seconds": {
+            "median": round(statistics.median(intervals), 6) if intervals else None,
+            "max": round(max(intervals), 6) if intervals else None,
+        },
+        "episodes": serialized,
+    }
 
 
 def _recovery_metrics_delta(before, after) -> dict:
@@ -170,6 +261,125 @@ def _recovery_metrics_delta(before, after) -> dict:
     ]
     result["final_health"] = after.health.value
     return result
+
+
+def aggregate_qualification_reports(
+    reports: Sequence[Mapping[str, object]],
+) -> dict:
+    """Aggregate sanitized sustained phases without inferring long-term rates."""
+    phases: list[tuple[Mapping[str, object], Mapping[str, object]]] = []
+    for report in reports:
+        if int(report.get("schema_version", 0)) != PROFILE_VALIDATION_SCHEMA_VERSION:
+            raise ValueError("qualification aggregation requires schema-v3 reports")
+        phases.extend(
+            (report, phase)
+            for phase in report.get("phases", [])
+            if str(phase.get("name", "")).startswith("sustained_burn_in")
+        )
+    if not phases:
+        raise ValueError("no sustained qualification phases found")
+    targets = {float(phase["target_seconds"]) for _, phase in phases}
+    if len(targets) != 1:
+        raise ValueError("qualification reports use different freshness targets")
+
+    runtime = sum(float(phase["actual_duration_seconds"]) for _, phase in phases)
+    session_fields = (
+        "explicit_requests",
+        "expected_fc4_responses",
+        "unmatched_fc4_observations",
+        "request_timeouts",
+        "connection_losses",
+        "invalid_frames",
+        "function_193_frames",
+        "observation_queue_drops",
+        "connection_failures",
+    )
+    session_totals = {
+        field: sum(int(phase["session_metrics"][field]) for _, phase in phases)
+        for field in session_fields
+    }
+    recovery_fields = (
+        "reconnect_attempts",
+        "successful_reconnects",
+        "failed_reconnects",
+        "retry_budget_exhausted",
+    )
+    recovery_totals = {
+        field: sum(int(phase["recovery_metrics"][field]) for _, phase in phases)
+        for field in recovery_fields
+    }
+    latency_values = [
+        float(value)
+        for _, phase in phases
+        for value in phase["session_metrics"]["request_latency_ms"]["values_ms"]
+    ]
+    latency_samples_total = sum(
+        int(phase["session_metrics"]["request_latency_ms"]["samples_total"])
+        for _, phase in phases
+    )
+    attempts = session_totals["explicit_requests"]
+    timeouts = session_totals["request_timeouts"]
+    reconnects = recovery_totals["reconnect_attempts"]
+    avoided = sum(
+        int(phase["profile_source_metrics"]["explicit_requests_avoided_unsolicited"])
+        for _, phase in phases
+    )
+    violations = sum(int(phase["stale_threshold_violations"]) for _, phase in phases)
+    stale_duration = sum(
+        float(phase["sampled_time_beyond_target_seconds"])
+        for _, phase in phases
+    )
+    longest = max(
+        float(phase["violation_episodes"]["longest_duration_seconds"])
+        for _, phase in phases
+    )
+    return {
+        "schema_version": 1,
+        "source_report_schema_version": PROFILE_VALIDATION_SCHEMA_VERSION,
+        "target_seconds": targets.pop(),
+        "sustained_runs": len(phases),
+        "total_runtime_seconds": round(runtime, 3),
+        "total_runtime_hours": round(runtime / 3600, 6),
+        "session_totals": session_totals,
+        "connection_generations": sum(
+            int(report["terminal_shutdown"]["connection_generations_created"])
+            for report in reports
+            if any(
+                str(phase.get("name", "")).startswith("sustained_burn_in")
+                for phase in report.get("phases", [])
+            )
+        ),
+        "recovery_totals": recovery_totals,
+        "explicit_requests_avoided_unsolicited": avoided,
+        "observed_rates": {
+            "timeouts_per_explicit_request": (
+                round(timeouts / attempts, 9) if attempts else None
+            ),
+            "timeouts_per_hour": round(timeouts * 3600 / runtime, 6),
+            "reconnects_per_hour": round(reconnects * 3600 / runtime, 6),
+        },
+        "request_latency_ms": _latency_summary(
+            latency_values, samples_total=latency_samples_total
+        ),
+        "freshness": {
+            "strict_target_met": all(bool(phase["target_met"]) for _, phase in phases),
+            "violating_samples": violations,
+            "sampled_time_beyond_target_seconds": round(stale_duration, 3),
+            "longest_violation_episode_seconds": round(longest, 3),
+            "maximum_worst_age_seconds": max(
+                float(phase["freshness"]["max_worst_age_seconds"])
+                for _, phase in phases
+            ),
+        },
+        "natural_recovery_events": [
+            event
+            for _, phase in phases
+            for event in phase["recovery_metrics"]["events"]
+        ],
+        "sample_size_limitation": (
+            "Observed qualification rates are not guaranteed long-term rates."
+        ),
+    }
 
 
 async def _run_profile_phase(
@@ -204,10 +414,10 @@ async def _run_profile_phase(
     )
     freshness = summarize_profile_samples(samples)
     violations = sum(
-        item["profile_freshness"]["max_age_seconds"] is None
+        _maximum_age(item["profile_freshness"]) is None
         or item["profile_freshness"]["known"]
         != item["profile_freshness"]["required"]
-        or item["profile_freshness"]["max_age_seconds"] > target_seconds
+        or _maximum_age(item["profile_freshness"]) > target_seconds
         for item in samples
     )
     unsafe_events = sum(
@@ -231,6 +441,9 @@ async def _run_profile_phase(
     freshness_met = bool(samples and not violations)
     stale_by_health = _time_beyond_target_by_health_state(samples, target_seconds)
     stale_by_episode = _time_beyond_target_by_recovery_episode(
+        samples, target_seconds, recovery_delta["events"]
+    )
+    violation_episodes = _violation_episode_summary(
         samples, target_seconds, recovery_delta["events"]
     )
     return {
@@ -267,6 +480,7 @@ async def _run_profile_phase(
         ),
         "sampled_time_beyond_target_by_health_state_seconds": stale_by_health,
         "sampled_time_beyond_target_attribution_seconds": stale_by_episode,
+        "violation_episodes": violation_episodes,
         "transport_recovery_safe": recovery_safe,
         "freshness_target_met": freshness_met,
         "target_met": bool(recovery_safe and freshness_met),
@@ -286,10 +500,14 @@ async def execute_profile_validation(
     """Run progressive profile validation and stop at the first failed gate."""
     if not targets or tuple(sorted(targets, reverse=True)) != tuple(targets):
         raise ValueError("targets must run slowest to fastest")
-    if min(targets) <= 0 or min(short_runs, forced_samples) <= 0:
-        raise ValueError("targets and sample counts must be positive")
-    if min(short_seconds, burn_seconds, safety_margin_seconds) <= 0:
-        raise ValueError("durations and safety margin must be positive")
+    if min(targets) <= 0 or short_runs < 0 or forced_samples <= 0:
+        raise ValueError("targets/forced samples must be positive; short runs nonnegative")
+    if short_runs and short_seconds <= 0:
+        raise ValueError("short duration must be positive when short runs are enabled")
+    if burn_seconds < 0 or safety_margin_seconds <= 0:
+        raise ValueError("burn duration must be nonnegative and safety margin positive")
+    if short_runs == 0 and burn_seconds == 0:
+        raise ValueError("at least one short or sustained phase is required")
     if client.profile is None:
         raise ValueError("profile validation requires a configured profile")
 
@@ -331,11 +549,21 @@ async def execute_profile_validation(
             "median_seconds": round(statistics.median(forced_durations), 3),
             "p95_seconds": round(forced_p95, 3),
             "max_seconds": round(max(forced_durations), 3),
-            "five_second_interval_consumed_percent": round(
+            "target_seconds": targets[0],
+            "target_interval_consumed_percent": round(
                 100 * statistics.median(forced_durations) / targets[0], 3
             ),
-            "five_second_p95_timing_headroom_seconds": round(
+            "p95_timing_headroom_seconds": round(
                 targets[0] - forced_p95, 3
+            ),
+            # Retained only for schema-v3 readers of historical five-second runs.
+            "five_second_interval_consumed_percent": (
+                round(100 * statistics.median(forced_durations) / 5, 3)
+                if targets[0] == 5
+                else None
+            ),
+            "five_second_p95_timing_headroom_seconds": (
+                round(5 - forced_p95, 3) if targets[0] == 5 else None
             ),
         }
 
@@ -352,7 +580,6 @@ async def execute_profile_validation(
                 )
                 break
             client.set_freshness_target(timedelta(seconds=trigger))
-            target_phases = []
             for index in range(short_runs):
                 phase = await _run_profile_phase(
                     client,
@@ -362,23 +589,23 @@ async def execute_profile_validation(
                 )
                 phase["request_trigger_age_seconds"] = round(trigger, 3)
                 report["phases"].append(phase)
-                target_phases.append(phase)
                 if not phase["target_met"]:
                     stable = False
                     break
             if not stable:
                 break
-            burn = await _run_profile_phase(
-                client,
-                name="sustained_burn_in",
-                target_seconds=target,
-                duration_seconds=burn_seconds,
-            )
-            burn["request_trigger_age_seconds"] = round(trigger, 3)
-            report["phases"].append(burn)
-            if not burn["target_met"]:
-                stable = False
-                break
+            if burn_seconds:
+                burn = await _run_profile_phase(
+                    client,
+                    name="sustained_burn_in",
+                    target_seconds=target,
+                    duration_seconds=burn_seconds,
+                )
+                burn["request_trigger_age_seconds"] = round(trigger, 3)
+                report["phases"].append(burn)
+                if not burn["target_met"]:
+                    stable = False
+                    break
     except LuxPowerCommunicationError as exc:
         report["fatal_error"] = type(exc).__name__
         block = client.last_profile_request_block
@@ -387,10 +614,17 @@ async def execute_profile_validation(
             "block": asdict(block) if block is not None else None,
         }
     finally:
+        operational_health_before_shutdown = client.acquisition_health.value
         await client.async_close()
     report["final_session_metrics"] = asdict(client.metrics())
     report["final_profile_metrics"] = asdict(client.profile_metrics())
     report["final_recovery_metrics"] = asdict(client.recovery_metrics())
+    report["terminal_shutdown"] = {
+        "intentional": True,
+        "operational_health_before_shutdown": operational_health_before_shutdown,
+        "health_after_shutdown": client.acquisition_health.value,
+        "connection_generations_created": client.metrics().connections,
+    }
     report["completed_at"] = utc_now().isoformat()
     return report
 
@@ -406,6 +640,16 @@ def _load_private_target(environ: Mapping[str, str]) -> tuple[str, int, str, str
         environ["LUXPOWER_DONGLE_SERIAL"],
         environ["LUXPOWER_INVERTER_SERIAL"],
     )
+
+
+def _write_private_report(path: Path, serialized: str) -> None:
+    """Write a sanitized live report with owner-only permissions."""
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            output.write(serialized + "\n")
+    finally:
+        os.chmod(path, 0o600)
 
 
 def _parse_targets(value: str) -> tuple[float, ...]:
@@ -451,6 +695,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--short-runs", type=int, default=2)
     parser.add_argument("--short-seconds", type=float, default=30)
     parser.add_argument("--burn-seconds", type=float, default=180)
+    parser.add_argument("--forced-samples", type=int, default=5)
     parser.add_argument("--enable-recovery", action="store_true")
     parser.add_argument("--recovery-window-seconds", type=float, default=300)
     parser.add_argument("--recovery-window-attempts", type=int, default=2)
@@ -494,11 +739,12 @@ async def _async_main(arguments: argparse.Namespace) -> int:
         short_runs=arguments.short_runs,
         short_seconds=arguments.short_seconds,
         burn_seconds=arguments.burn_seconds,
+        forced_samples=arguments.forced_samples,
     )
     report["profile"]["capability_provenance"] = arguments.capability_provenance
     serialized = json.dumps(report, indent=2, sort_keys=True)
     if arguments.output:
-        arguments.output.write_text(serialized + "\n", encoding="utf-8")
+        _write_private_report(arguments.output, serialized)
     print("LuxPower energy-flow READ-ONLY validation completed", file=sys.stderr)
     print(serialized)
     return 0

@@ -8,6 +8,7 @@ from collections import deque
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 import json
+import math
 import os
 from pathlib import Path
 import statistics
@@ -21,7 +22,7 @@ from custom_components.lxp_modbus.classes.read_session import (
     LuxReadSessionMetrics,
     LuxReadSessionSnapshot,
 )
-from custom_components.lxp_modbus.const import TOTAL_REGISTERS
+from custom_components.lxp_modbus.const import READ_TIMEOUT, TOTAL_REGISTERS
 from custom_components.lxp_modbus.exceptions import (
     LuxPowerAmbiguousRequestError,
     LuxPowerCommunicationError,
@@ -127,7 +128,10 @@ class _ActiveRecovery:
     block: InputReadBlock
     started_monotonic: float
     episode_started_at: str
+    recovery_started_at: str
     cooldown_seconds: float
+    reconnect_started_at: str | None = None
+    connection_established_at: str | None = None
     failure_to_connection_seconds: float | None = None
     maximum_profile_age_seconds: float | None = None
 
@@ -468,6 +472,7 @@ class LuxPowerHybridReadClient:
         if policy is None:
             raise error
         now = self._monotonic()
+        recovery_started_at = utc_now().isoformat()
         cutoff = now - policy.rolling_window_seconds
         while self._reconnect_attempt_times and self._reconnect_attempt_times[0] < cutoff:
             self._reconnect_attempt_times.popleft()
@@ -477,6 +482,7 @@ class LuxPowerHybridReadClient:
                 block=block,
                 started_monotonic=now,
                 episode_started_at=episode_started_at,
+                recovery_started_at=recovery_started_at,
                 cooldown_seconds=0,
                 maximum_profile_age_seconds=self._maximum_profile_age_seconds(),
             )
@@ -497,6 +503,7 @@ class LuxPowerHybridReadClient:
             block=block,
             started_monotonic=now,
             episode_started_at=episode_started_at,
+            recovery_started_at=recovery_started_at,
             cooldown_seconds=cooldown,
             maximum_profile_age_seconds=self._maximum_profile_age_seconds(),
         )
@@ -524,6 +531,7 @@ class LuxPowerHybridReadClient:
             )
             self._active_recovery = None
             raise LuxPowerSessionClosedError("recovery stopped by session shutdown")
+        active.reconnect_started_at = utc_now().isoformat()
         try:
             await self._session.async_connect()
         except asyncio.CancelledError:
@@ -556,6 +564,7 @@ class LuxPowerHybridReadClient:
             self._active_recovery = None
             raise LuxPowerSessionClosedError("recovery stopped by session shutdown")
         self._successful_reconnects += 1
+        active.connection_established_at = utc_now().isoformat()
         active.failure_to_connection_seconds = self._monotonic() - now
         active.maximum_profile_age_seconds = self._max_optional(
             active.maximum_profile_age_seconds,
@@ -610,6 +619,9 @@ class LuxPowerHybridReadClient:
             RecoveryEvent(
                 failure_kind=active.failure_kind,
                 episode_started_at=active.episode_started_at,
+                recovery_started_at=active.recovery_started_at,
+                reconnect_started_at=active.reconnect_started_at,
+                connection_established_at=active.connection_established_at,
                 ended_at=utc_now().isoformat(),
                 failed_register_start=active.block.start,
                 failed_register_count=active.block.count,
@@ -904,6 +916,7 @@ class LuxPowerHybridReadClient:
             "required": len(self._profile.required_registers),
             "median_age_seconds": round(statistics.median(ages), 3) if ages else None,
             "max_age_seconds": round(max(ages), 3) if ages else None,
+            "max_age_seconds_raw": max(ages) if ages else None,
             "worst_register": worst_register,
         }
 
@@ -924,6 +937,68 @@ class LuxPowerHybridReadClient:
             "median_age_seconds": round(statistics.median(ages), 3) if ages else None,
             "max_age_seconds": round(max(ages), 3) if ages else None,
         }
+
+
+def _nearest_rank(values: Sequence[float], percentile: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    return ordered[max(0, math.ceil(len(ordered) * percentile) - 1)]
+
+
+def _latency_summary(latencies: Sequence[float], *, samples_total: int) -> dict:
+    """Return a sanitized exact distribution for retained accepted responses."""
+    values = tuple(float(value) for value in latencies)
+    truncated = samples_total > len(values)
+    thresholds_ms = (1000, 1500, 2000, 2500)
+    above = {
+        str(threshold): {
+            "count": sum(value > threshold for value in values),
+            "percent": (
+                round(100 * sum(value > threshold for value in values) / len(values), 6)
+                if values
+                else None
+            ),
+        }
+        for threshold in thresholds_ms
+    }
+    histogram_limits = (500, 750, 1000, 1500, 2000, 2500, 3000)
+    histogram: dict[str, int] = {}
+    lower = 0
+    for upper in histogram_limits:
+        histogram[f"{lower}-{upper}"] = sum(
+            lower < value <= upper for value in values
+        )
+        lower = upper
+    histogram[">3000"] = sum(value > 3000 for value in values)
+    maximum = max(values) if values else None
+    return {
+        "samples": len(values),
+        "samples_total": samples_total,
+        "truncated": truncated,
+        "mean": round(statistics.fmean(values), 3) if values and not truncated else None,
+        "median": round(statistics.median(values), 3) if values and not truncated else None,
+        "p95": (
+            round(_nearest_rank(values, 0.95), 3)
+            if len(values) >= 20 and not truncated
+            else None
+        ),
+        "p99": (
+            round(_nearest_rank(values, 0.99), 3)
+            if len(values) >= 100 and not truncated
+            else None
+        ),
+        "min": round(min(values), 3) if values and not truncated else None,
+        "max": round(maximum, 3) if maximum is not None and not truncated else None,
+        "successful_max_margin_to_timeout_ms": (
+            round(READ_TIMEOUT * 1000 - maximum, 3)
+            if maximum is not None and not truncated
+            else None
+        ),
+        "above_threshold_ms": above if not truncated else None,
+        "histogram_ms": histogram if not truncated else None,
+        "values_ms": [round(value, 3) for value in values],
+    }
 
 
 def _metrics_delta(
@@ -958,15 +1033,9 @@ def _metrics_delta(
         after.request_latencies_ms[-new_latency_count:]
         if new_latency_count else ()
     )
-    delta["request_latency_ms"] = {
-        "samples": len(latencies),
-        "samples_total": new_latency_count,
-        "truncated": new_latency_count > len(latencies),
-        "mean": round(statistics.fmean(latencies), 3) if latencies else None,
-        "median": round(statistics.median(latencies), 3) if latencies else None,
-        "min": round(min(latencies), 3) if latencies else None,
-        "max": round(max(latencies), 3) if latencies else None,
-    }
+    delta["request_latency_ms"] = _latency_summary(
+        latencies, samples_total=new_latency_count
+    )
     return delta
 
 

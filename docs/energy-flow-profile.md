@@ -98,4 +98,10 @@ queue loss, or false freshness was observed.
 Therefore sustained five-second operation is **not yet demonstrated**. Three-
 and two-second validation was not attempted after that failure. Production Home
 Assistant integration remains deferred; the current production cadence and
-transport are unchanged.
+transport network behavior are unchanged. Qualification-only metric retention was
+subsequently enlarged for hour-scale latency evidence.
+
+Subsequent ten-second qualification is documented in
+[`ten-second-qualification.md`](ten-second-qualification.md). Two independent
+30-minute samples both failed the strict ten-second maximum-age criterion despite
+safe bounded recovery, so production integration remains deferred.
