@@ -38,6 +38,7 @@ from luxpower.profile_validation import (
     _time_beyond_target,
     _time_beyond_target_by_health_state,
     _time_beyond_target_by_recovery_episode,
+    _validate_deadline_options,
     _verify_live_source_revision,
     _violation_episode_summary,
     _write_private_report,
@@ -185,6 +186,24 @@ def test_request_latency_distribution_and_timeout_thresholds():
     assert summary["above_threshold_ms"]["2500"]["count"] == 1
 
 
+def test_ten_second_reply_summary_uses_its_actual_deadline_and_decision_buckets():
+    summary = _latency_summary(
+        [700.0, 3000.0, 4000.0, 5000.0, 6000.0],
+        samples_total=5,
+        reply_timeout_seconds=10,
+    )
+
+    assert summary["reply_timeout_seconds"] == 10
+    assert summary["successful_max_margin_to_timeout_ms"] == 4000.0
+    assert summary["decision_buckets_ms"] == {
+        "0-3000": 2,
+        ">3000-5000": 2,
+        ">5000-10000": 1,
+        ">10000": 0,
+        "beyond_reply_timeout": 0,
+    }
+
+
 def test_truncated_latency_history_suppresses_full_distribution_claims():
     summary = _latency_summary([700.0] * 4096, samples_total=5000)
 
@@ -196,6 +215,7 @@ def test_truncated_latency_history_suppresses_full_distribution_claims():
     assert summary["p99"] is None
     assert summary["max"] is None
     assert summary["above_threshold_ms"] is None
+    assert summary["decision_buckets_ms"] is None
     assert summary["histogram_ms"] is None
 
 
@@ -275,6 +295,61 @@ def test_multiple_run_aggregation_rates_and_terminal_shutdown():
     serialized = json.dumps(aggregate)
     assert "192.0.2" not in serialized
     assert "PRIVATE" not in serialized
+
+
+def test_schema_v5_aggregation_rejects_mixed_deadline_provenance():
+    reports = [
+        _qualification_report(
+            timeout=0,
+            reconnect=0,
+            target_met=True,
+            maximum=8.0,
+            values=[700.0] * 100,
+        )
+        for _ in range(2)
+    ]
+    for report in reports:
+        report["schema_version"] = 5
+        report["profile"] = {
+            "definition_version": 1,
+            "name": "energy_flow",
+            "grid_topology": "single_phase",
+            "active_pv_strings": [1, 2, 3],
+            "load_layout": "standard",
+            "required_registers": [0, 114],
+            "blocks": [{"start": 0, "count": 40}, {"start": 80, "count": 40}],
+        }
+        report["provenance"] = {
+            "implementation_revision": "a" * 40,
+            "profile_definition_version": 1,
+            "drain_timeout_seconds": 3,
+            "reply_timeout_seconds": 3,
+            "split_request_deadlines": True,
+        }
+
+    aggregate = aggregate_qualification_reports(reports)
+    assert aggregate["deadline_configuration"] == {
+        "drain_timeout_seconds": 3,
+        "reply_timeout_seconds": 3.0,
+        "split_request_deadlines": True,
+    }
+
+    reports[1]["provenance"]["reply_timeout_seconds"] = 10
+    with pytest.raises(ValueError, match="different revisions, profiles, or deadline"):
+        aggregate_qualification_reports(reports)
+
+    reports[1]["provenance"]["reply_timeout_seconds"] = 3
+    reports[1]["profile"]["active_pv_strings"] = [1, 2]
+    with pytest.raises(ValueError, match="different revisions, profiles, or deadline"):
+        aggregate_qualification_reports(reports)
+
+
+def test_live_qualification_requires_both_phase_deadlines():
+    _validate_deadline_options(None, None)
+    _validate_deadline_options(3, 10)
+
+    with pytest.raises(ValueError, match="must be supplied together"):
+        _validate_deadline_options(3, None)
 
 
 def test_private_report_permissions(tmp_path):
@@ -368,7 +443,7 @@ def _zero_session_metrics():
 
 
 @pytest.mark.asyncio
-async def test_short_only_schema_v4_provenance_and_intentional_shutdown_health():
+async def test_short_only_schema_v5_provenance_and_intentional_shutdown_health():
     class QualificationClient:
         def __init__(self):
             self.profile = EnergyFlowReadProfile(
@@ -442,15 +517,18 @@ async def test_short_only_schema_v4_provenance_and_intentional_shutdown_health()
         implementation_revision="a" * 40,
     )
 
-    assert report["schema_version"] == 4
-    assert report["validation_version"] == "4.0"
+    assert report["schema_version"] == 5
+    assert report["validation_version"] == "5.0"
     assert report["provenance"] == {
         "implementation_revision": "a" * 40,
         "revision_source": "operator_supplied",
         "profile_definition_version": 1,
-        "diagnostic_schema_version": 1,
+        "diagnostic_schema_version": 3,
         "run_mode": "critical_profile_timeout_diagnostics",
         "request_timeout_seconds": 3,
+        "drain_timeout_seconds": 3,
+        "reply_timeout_seconds": 3,
+        "split_request_deadlines": False,
     }
     assert [phase["name"] for phase in report["phases"]] == ["short_1"]
     assert report["phases"][0]["target_met"] is True
