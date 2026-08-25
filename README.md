@@ -96,6 +96,10 @@ The API does not currently expose calculated values. A future calculated value
 that depends on multiple registers must not claim freshness newer than its oldest
 required input. The standalone facade intentionally provides no write operation.
 
+Contributors can measure real dongle timing with the separate, strictly read-only
+[hardware benchmark](docs/hardware-benchmark.md). The benchmark does not alter the
+integration polling path or expose inverter writes.
+
 > [!WARNING]
 > ### Important Note on Read-Only Mode (Available since v0.1.5)
 >
