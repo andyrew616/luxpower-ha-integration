@@ -1,17 +1,6 @@
 from typing import Final
-from homeassistant.const import Platform
 
 DOMAIN = "lxp_modbus"
-
-PLATFORMS: Final = [
-    Platform.SENSOR,
-    Platform.BINARY_SENSOR,
-    Platform.NUMBER,
-    Platform.TIME,
-    Platform.SELECT,
-    Platform.BUTTON,
-    Platform.SWITCH,
-]
 
 CONF_HOST = "host"
 CONF_PORT = "port"

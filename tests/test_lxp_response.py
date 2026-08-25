@@ -24,7 +24,10 @@ class TestLxpResponse:
         assert response.packet_error is False
         assert response.dongle_serial == b"DG99999999"
         assert response.serial_number == b"99999T9999"
-        assert response.exception > 0
+        assert response.device_function == 134
+        assert response.register == 234
+        assert response.exception == 3
+        assert response.parsed_values_dictionary == {}
 
     @pytest.mark.asyncio
     async def test_message_193_parsing(self):
@@ -37,4 +40,3 @@ class TestLxpResponse:
         assert response.exception == 0
         assert response.dongle_serial == b"DG99999999"
         assert len(response.value)
-

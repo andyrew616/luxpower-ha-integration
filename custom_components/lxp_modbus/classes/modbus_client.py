@@ -3,8 +3,6 @@ import asyncio
 import logging
 import time as time_lib
 
-from homeassistant.helpers.update_coordinator import UpdateFailed
-
 from ..const import (
     BATTERY_BACKOFF_POLL_EVERY,
     BATTERY_EMPTY_POLLS_BEFORE_BACKOFF,
@@ -24,6 +22,7 @@ from ..const import (
     WRITE_RETRY_DELAY,
 )
 from ..constants.input_registers import I_BAT_PARALLEL_NUM
+from ..exceptions import LuxPowerCommunicationError
 from .connection_manager import ModbusConnectionManager
 from .data_validator import is_data_sane
 from .lxp_batteries import LxpBatteries
@@ -354,7 +353,7 @@ class LxpModbusApiClient:
             )
             return self._snapshot()
 
-        raise UpdateFailed(f"Error communicating with inverter: {error}")
+        raise LuxPowerCommunicationError(f"Error communicating with inverter: {error}")
 
     async def async_write_register(self, register: int, value: int) -> bool:
         """Write a single register value to the inverter with validation and retries."""

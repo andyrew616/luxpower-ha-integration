@@ -8,6 +8,18 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from custom_components.lxp_modbus.classes.lxp_request_builder import LxpRequestBuilder
 
 
+def test_read_request_wire_bytes_are_unchanged():
+    """Pin the proven read packet format at the standalone boundary."""
+    packet = LxpRequestBuilder.prepare_packet_for_read(
+        b"DG44302247", b"4434280298", 0, 125, 4
+    )
+
+    assert packet.hex() == (
+        "a11a0100200001c2444734343330323234371200000434343334323830323938"
+        "00007d0069d8"
+    )
+
+
 def test_prepare_packet_for_write_accepts_register_values_above_signed_range():
     """Register writes should preserve the full 16-bit word."""
     packet = LxpRequestBuilder.prepare_packet_for_write(
