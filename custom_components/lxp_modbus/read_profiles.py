@@ -19,6 +19,7 @@ from .classes.read_session import (
 from .constants import input_registers as input_register
 
 HARDWARE_READ_BLOCK_SIZE = 40
+ENERGY_FLOW_PROFILE_DEFINITION_VERSION = 1
 OFF_GRID_STATES = frozenset({64, 96, 128, 136, 192})
 
 

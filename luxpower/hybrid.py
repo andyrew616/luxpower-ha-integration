@@ -51,6 +51,11 @@ from custom_components.lxp_modbus.telemetry_groups import (
     input_register_group,
     input_registers_for_group,
 )
+from custom_components.lxp_modbus.timeout_diagnostics import (
+    LuxReadDiagnosticsSnapshot,
+    LuxReadPurpose,
+    LuxReadRequestContext,
+)
 
 HYBRID_SCHEMA_VERSION = 1
 HYBRID_VERSION = "1.0"
@@ -226,6 +231,15 @@ class LuxPowerHybridReadClient:
     def metrics(self) -> LuxReadSessionMetrics:
         return self._session.metrics()
 
+    def diagnostics(self) -> LuxReadDiagnosticsSnapshot:
+        """Return detached sanitized request-lifecycle diagnostics."""
+        return self._session.diagnostics()
+
+    @property
+    def request_timeout_seconds(self) -> float:
+        """Actual combined drain/response deadline used by the read session."""
+        return self._session.request_timeout_seconds
+
     @property
     def profile(self) -> EnergyFlowReadProfile | None:
         """The resolved experimental profile, if configured."""
@@ -300,7 +314,11 @@ class LuxPowerHybridReadClient:
             if self._block_is_fresh(block, self._session.snapshot(), utc_now()):
                 skipped.append(block)
                 continue
-            await self._session.async_read_input(block.start, block.count)
+            await self._session.async_read_input(
+                block.start,
+                block.count,
+                context=self._request_context(LuxReadPurpose.OPERATIONAL_PROBE),
+            )
             requested.append(block)
         return HybridRefreshResult(
             requested_blocks=tuple(requested),
@@ -335,7 +353,16 @@ class LuxPowerHybridReadClient:
                     self._last_profile_request_block = block
                     request_started_at = utc_now().isoformat()
                     try:
-                        await self._session.async_read_input(block.start, block.count)
+                        purpose = (
+                            LuxReadPurpose.RECOVERY_REACQUISITION
+                            if active_recovery is not None
+                            else LuxReadPurpose.NORMAL_PROFILE
+                        )
+                        await self._session.async_read_input(
+                            block.start,
+                            block.count,
+                            context=self._request_context(purpose),
+                        )
                         requested.append(block)
                     except asyncio.CancelledError:
                         self._health = AcquisitionHealth.DEGRADED
@@ -690,6 +717,14 @@ class LuxPowerHybridReadClient:
         ]
         return max(ages) if ages else None
 
+    def _request_context(self, purpose: LuxReadPurpose) -> LuxReadRequestContext:
+        """Capture sanitized profile state without affecting request decisions."""
+        return LuxReadRequestContext(
+            purpose=purpose,
+            profile_worst_age_seconds=self._maximum_profile_age_seconds(),
+            profile_health=self._health.value,
+        )
+
     def _profile_is_fresh(self) -> bool:
         if self._profile is None:
             return True
@@ -722,7 +757,11 @@ class LuxPowerHybridReadClient:
         started = time.monotonic()
         for block in self._profile.read_blocks:
             self._last_profile_request_block = block
-            await self._session.async_read_input(block.start, block.count)
+            await self._session.async_read_input(
+                block.start,
+                block.count,
+                context=self._request_context(LuxReadPurpose.FORCED_PREFLIGHT),
+            )
         self._health = (
             AcquisitionHealth.HEALTHY
             if self._profile_is_fresh()
@@ -739,7 +778,11 @@ class LuxPowerHybridReadClient:
         """Force one six-block routing validation independent of freshness."""
         started = time.monotonic()
         for block in OPERATIONAL_READ_BLOCKS:
-            await self._session.async_read_input(block.start, block.count)
+            await self._session.async_read_input(
+                block.start,
+                block.count,
+                context=self._request_context(LuxReadPurpose.OPERATIONAL_PROBE),
+            )
         return HybridRefreshResult(
             requested_blocks=OPERATIONAL_READ_BLOCKS,
             fresh_blocks_skipped=(),
@@ -749,7 +792,11 @@ class LuxPowerHybridReadClient:
     async def async_full_scan(self) -> LuxReadSessionSnapshot:
         """Explicitly retain the proven aligned 0-749 full-scan capability."""
         for block in FULL_INPUT_READ_BLOCKS:
-            await self._session.async_read_input(block.start, block.count)
+            await self._session.async_read_input(
+                block.start,
+                block.count,
+                context=self._request_context(LuxReadPurpose.FULL_SCAN),
+            )
         self._last_full_scan_completed_at = utc_now()
         return self._session.snapshot()
 

@@ -10,28 +10,39 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import statistics
+import subprocess
 import sys
 import time
 from typing import Mapping, Sequence
 
+from custom_components.lxp_modbus.const import READ_TIMEOUT
 from custom_components.lxp_modbus.exceptions import LuxPowerCommunicationError
 from custom_components.lxp_modbus.observation import utc_now
 from custom_components.lxp_modbus.read_profiles import (
+    ENERGY_FLOW_PROFILE_DEFINITION_VERSION,
     EnergyFlowReadProfile,
     GridTopology,
     LoadLayout,
     profile_block_details,
 )
 from custom_components.lxp_modbus.recovery import RecoveryPolicy
+from custom_components.lxp_modbus.timeout_diagnostics import (
+    LuxReadDiagnosticJournal,
+    LuxReadDiagnosticsSnapshot,
+    LuxReadPurpose,
+    LuxReadRequestDiagnostic,
+    LuxReadRequestOutcome,
+)
 from luxpower.hybrid import (
     LuxPowerHybridReadClient,
     _latency_summary,
     _metrics_delta,
 )
 
-PROFILE_VALIDATION_SCHEMA_VERSION = 3
-PROFILE_VALIDATION_VERSION = "3.1"
+PROFILE_VALIDATION_SCHEMA_VERSION = 4
+PROFILE_VALIDATION_VERSION = "4.0"
 
 
 def _maximum_age(freshness: Mapping[str, object]) -> float | None:
@@ -263,14 +274,239 @@ def _recovery_metrics_delta(before, after) -> dict:
     return result
 
 
+def _numeric_summary(values: Sequence[float | None]) -> dict:
+    """Summarize present finite timing values without inventing missing data."""
+    present = [float(value) for value in values if value is not None]
+    if not present:
+        return {"samples": 0, "median": None, "p95": None, "min": None, "max": None}
+    return {
+        "samples": len(present),
+        "median": round(statistics.median(present), 6),
+        "p95": round(_nearest_rank_p95(present), 6),
+        "min": round(min(present), 6),
+        "max": round(max(present), 6),
+    }
+
+
+def _request_group_summary(
+    requests: Sequence[LuxReadRequestDiagnostic],
+) -> dict:
+    attempts = len(requests)
+    successes = [
+        request
+        for request in requests
+        if request.outcome is LuxReadRequestOutcome.SUCCESS
+    ]
+    timeouts = [
+        request
+        for request in requests
+        if request.outcome is LuxReadRequestOutcome.RESPONSE_TIMEOUT
+    ]
+    return {
+        "attempts": attempts,
+        "successes": len(successes),
+        "timeouts": len(timeouts),
+        "timeout_percent": (
+            round(100 * len(timeouts) / attempts, 6) if attempts else None
+        ),
+        "outcomes": {
+            outcome.value: sum(request.outcome is outcome for request in requests)
+            for outcome in LuxReadRequestOutcome
+            if any(request.outcome is outcome for request in requests)
+        },
+        "accepted_response_latency_ms": _latency_summary(
+            [
+                request.accepted_response_latency_ms
+                for request in successes
+                if request.accepted_response_latency_ms is not None
+            ],
+            samples_total=len(successes),
+        ),
+        "request_start_spacing_seconds": _numeric_summary(
+            [request.time_since_previous_request_start_seconds for request in requests]
+        ),
+        "connection_age_seconds": _numeric_summary(
+            [request.connection_age_seconds for request in requests]
+        ),
+        "requests_previously_on_generation": _numeric_summary(
+            [float(request.requests_previously_on_generation) for request in requests]
+        ),
+    }
+
+
+def _analyze_request_diagnostics(
+    requests: Sequence[LuxReadRequestDiagnostic],
+    *,
+    complete: bool,
+) -> dict:
+    by_block: dict[str, list[LuxReadRequestDiagnostic]] = {}
+    by_purpose: dict[str, list[LuxReadRequestDiagnostic]] = {}
+    for request in requests:
+        block = f"{request.register_start}-{request.register_end}"
+        by_block.setdefault(block, []).append(request)
+        by_purpose.setdefault(request.purpose.value, []).append(request)
+    successful = [
+        request
+        for request in requests
+        if request.outcome is LuxReadRequestOutcome.SUCCESS
+    ]
+    failed = [
+        request
+        for request in requests
+        if request.outcome is not LuxReadRequestOutcome.SUCCESS
+    ]
+    timed_out = [
+        request
+        for request in requests
+        if request.outcome is LuxReadRequestOutcome.RESPONSE_TIMEOUT
+    ]
+    generations: dict[str, dict[str, int]] = {}
+    for request in requests:
+        generation = str(request.generation)
+        item = generations.setdefault(
+            generation,
+            {"attempts": 0, "successes": 0, "timeouts": 0},
+        )
+        item["attempts"] += 1
+        item["successes"] += request.outcome is LuxReadRequestOutcome.SUCCESS
+        item["timeouts"] += request.outcome is LuxReadRequestOutcome.RESPONSE_TIMEOUT
+    return {
+        "complete_request_history": complete,
+        "overall": _request_group_summary(requests),
+        "by_block": {
+            block: _request_group_summary(group)
+            for block, group in sorted(by_block.items())
+        },
+        "by_purpose": {
+            purpose: _request_group_summary(group)
+            for purpose, group in sorted(by_purpose.items())
+        },
+        "successful_vs_failed": {
+            "successful_request_start_spacing_seconds": _numeric_summary(
+                [
+                    request.time_since_previous_request_start_seconds
+                    for request in successful
+                ]
+            ),
+            "failed_request_start_spacing_seconds": _numeric_summary(
+                [
+                    request.time_since_previous_request_start_seconds
+                    for request in failed
+                ]
+            ),
+            "successful_connection_age_seconds": _numeric_summary(
+                [request.connection_age_seconds for request in successful]
+            ),
+            "failed_connection_age_seconds": _numeric_summary(
+                [request.connection_age_seconds for request in failed]
+            ),
+        },
+        "traffic_near_timeouts": {
+            "timeout_requests": len(timed_out),
+            "unmatched_fc4_while_pending": sum(
+                request.unmatched_fc4_while_pending for request in timed_out
+            ),
+            "fc193_while_pending": sum(
+                request.fc193_while_pending for request in timed_out
+            ),
+            "invalid_frames_while_pending": sum(
+                request.invalid_frames_while_pending for request in timed_out
+            ),
+            "time_since_previous_unmatched_fc4_seconds": _numeric_summary(
+                [request.time_since_previous_unmatched_fc4_seconds for request in timed_out]
+            ),
+            "time_since_previous_fc193_seconds": _numeric_summary(
+                [request.time_since_previous_fc193_seconds for request in timed_out]
+            ),
+        },
+        "requests_by_generation": generations,
+        "late_old_generation_response": {
+            "observation_supported": False,
+            "detected": None,
+            "limitation": (
+                "generation fencing rejects old bytes before frame routing; "
+                "absence of a decoded late frame is not proof that no bytes arrived"
+            ),
+        },
+    }
+
+
+def _diagnostic_delta(
+    before: LuxReadDiagnosticsSnapshot | None,
+    after: LuxReadDiagnosticsSnapshot | None,
+) -> dict:
+    """Return a cursor-based bounded phase view with explicit truncation."""
+    if before is None or after is None:
+        return {
+            "available": False,
+            "reason": "client does not expose Stage 9 request diagnostics",
+        }
+    request_cursor = before.requests_total
+    event_cursor = before.events_total
+    expected_requests = after.requests_total - request_cursor
+    expected_events = after.events_total - event_cursor
+    requests = tuple(
+        request
+        for request in after.requests
+        if request.request_sequence > request_cursor
+    )
+    events = tuple(
+        event for event in after.events if event.sequence > event_cursor
+    )
+    episodes = tuple(
+        episode
+        for episode in after.timeout_episodes
+        if episode.request.request_sequence > request_cursor
+    )
+    requests_complete = len(requests) == expected_requests
+    events_complete = len(events) == expected_events
+    return {
+        "available": True,
+        "schema_version": after.schema_version,
+        "request_cursor": request_cursor,
+        "event_cursor": event_cursor,
+        "expected_requests": expected_requests,
+        "retained_requests": len(requests),
+        "request_history_complete": requests_complete,
+        "expected_events": expected_events,
+        "retained_events": len(events),
+        "event_history_complete": events_complete,
+        "retention": {
+            "request_capacity": after.request_capacity,
+            "requests_total": after.requests_total,
+            "requests_dropped": after.requests_dropped,
+            "event_capacity": after.event_capacity,
+            "events_total": after.events_total,
+            "events_dropped": after.events_dropped,
+            "failure_capacity": after.failure_capacity,
+            "failures_total": after.failures_total,
+            "failures_dropped": after.failures_dropped,
+        },
+        "requests": [asdict(request) for request in requests],
+        "events": [asdict(event) for event in events],
+        "timeout_episodes": [asdict(episode) for episode in episodes],
+        "analysis": _analyze_request_diagnostics(
+            requests,
+            complete=requests_complete,
+        ),
+    }
+
+
+def _client_diagnostics(
+    client: LuxPowerHybridReadClient,
+) -> LuxReadDiagnosticsSnapshot | None:
+    diagnostics = getattr(client, "diagnostics", None)
+    return diagnostics() if diagnostics is not None else None
+
+
 def aggregate_qualification_reports(
     reports: Sequence[Mapping[str, object]],
 ) -> dict:
     """Aggregate sanitized sustained phases without inferring long-term rates."""
     phases: list[tuple[Mapping[str, object], Mapping[str, object]]] = []
     for report in reports:
-        if int(report.get("schema_version", 0)) != PROFILE_VALIDATION_SCHEMA_VERSION:
-            raise ValueError("qualification aggregation requires schema-v3 reports")
+        if int(report.get("schema_version", 0)) not in (3, 4):
+            raise ValueError("qualification aggregation requires schema-v3/v4 reports")
         phases.extend(
             (report, phase)
             for phase in report.get("phases", [])
@@ -335,7 +571,11 @@ def aggregate_qualification_reports(
     )
     return {
         "schema_version": 1,
-        "source_report_schema_version": PROFILE_VALIDATION_SCHEMA_VERSION,
+        "source_report_schema_version": (
+            next(iter({int(report["schema_version"]) for report, _ in phases}))
+            if len({int(report["schema_version"]) for report, _ in phases}) == 1
+            else sorted({int(report["schema_version"]) for report, _ in phases})
+        ),
         "target_seconds": targets.pop(),
         "sustained_runs": len(phases),
         "total_runtime_seconds": round(runtime, 3),
@@ -392,6 +632,7 @@ async def _run_profile_phase(
     before_session = client.metrics()
     before_profile = client.profile_metrics()
     before_recovery = client.recovery_metrics()
+    before_diagnostics = _client_diagnostics(client)
     samples: list[dict] = []
     error = None
     started = time.monotonic()
@@ -403,6 +644,7 @@ async def _run_profile_phase(
     after_session = client.metrics()
     after_profile = client.profile_metrics()
     after_recovery = client.recovery_metrics()
+    after_diagnostics = _client_diagnostics(client)
     session_delta = _metrics_delta(before_session, after_session)
     attempted = (
         after_profile.explicit_requests_attempted
@@ -484,6 +726,10 @@ async def _run_profile_phase(
         "transport_recovery_safe": recovery_safe,
         "freshness_target_met": freshness_met,
         "target_met": bool(recovery_safe and freshness_met),
+        "request_diagnostics": _diagnostic_delta(
+            before_diagnostics,
+            after_diagnostics,
+        ),
     }
 
 
@@ -496,6 +742,8 @@ async def execute_profile_validation(
     burn_seconds: float,
     forced_samples: int = 5,
     safety_margin_seconds: float = 0.25,
+    implementation_revision: str | None = None,
+    implementation_revision_verified: bool = False,
 ) -> dict:
     """Run progressive profile validation and stop at the first failed gate."""
     if not targets or tuple(sorted(targets, reverse=True)) != tuple(targets):
@@ -510,10 +758,28 @@ async def execute_profile_validation(
         raise ValueError("at least one short or sustained phase is required")
     if client.profile is None:
         raise ValueError("profile validation requires a configured profile")
+    if implementation_revision is not None and not re.fullmatch(
+        r"[0-9a-f]{40}", implementation_revision
+    ):
+        raise ValueError("implementation_revision must be a lowercase 40-byte SHA")
 
     report = {
         "schema_version": PROFILE_VALIDATION_SCHEMA_VERSION,
         "validation_version": PROFILE_VALIDATION_VERSION,
+        "provenance": {
+            "implementation_revision": implementation_revision or "unrecorded",
+            "revision_source": (
+                "clean_git_checkout_verified"
+                if implementation_revision_verified
+                else "operator_supplied" if implementation_revision else "unavailable"
+            ),
+            "profile_definition_version": ENERGY_FLOW_PROFILE_DEFINITION_VERSION,
+            "diagnostic_schema_version": LuxReadDiagnosticJournal.SCHEMA_VERSION,
+            "run_mode": "critical_profile_timeout_diagnostics",
+            "request_timeout_seconds": getattr(
+                client, "request_timeout_seconds", READ_TIMEOUT
+            ),
+        },
         "started_at": utc_now().isoformat(),
         "safety": {
             "read_only": True,
@@ -521,6 +787,7 @@ async def execute_profile_validation(
             "writes_exposed": False,
         },
         "profile": {
+            "definition_version": ENERGY_FLOW_PROFILE_DEFINITION_VERSION,
             "name": client.profile.name.value,
             "grid_topology": client.profile.grid_topology.value,
             "active_pv_strings": sorted(client.profile.active_pv_strings),
@@ -538,6 +805,7 @@ async def execute_profile_validation(
     await client.async_connect()
     stable = True
     try:
+        forced_diagnostics_before = _client_diagnostics(client)
         forced_durations = []
         for _ in range(forced_samples):
             result = await client.async_read_profile()
@@ -564,6 +832,10 @@ async def execute_profile_validation(
             ),
             "five_second_p95_timing_headroom_seconds": (
                 round(5 - forced_p95, 3) if targets[0] == 5 else None
+            ),
+            "request_diagnostics": _diagnostic_delta(
+                forced_diagnostics_before,
+                _client_diagnostics(client),
             ),
         }
 
@@ -619,6 +891,10 @@ async def execute_profile_validation(
     report["final_session_metrics"] = asdict(client.metrics())
     report["final_profile_metrics"] = asdict(client.profile_metrics())
     report["final_recovery_metrics"] = asdict(client.recovery_metrics())
+    final_diagnostics = _client_diagnostics(client)
+    report["final_request_diagnostics"] = (
+        asdict(final_diagnostics) if final_diagnostics is not None else None
+    )
     report["terminal_shutdown"] = {
         "intentional": True,
         "operational_health_before_shutdown": operational_health_before_shutdown,
@@ -668,11 +944,54 @@ def _parse_pv_strings(value: str) -> frozenset[int]:
     return strings
 
 
+def _parse_implementation_revision(value: str) -> str:
+    if not re.fullmatch(r"[0-9a-f]{40}", value):
+        raise argparse.ArgumentTypeError(
+            "implementation revision must be a lowercase 40-byte SHA"
+        )
+    return value
+
+
+def _verify_live_source_revision(
+    expected_revision: str | None,
+    *,
+    repository_root: Path | None = None,
+) -> str:
+    """Bind live evidence to the exact clean Git checkout being executed."""
+    if expected_revision is None:
+        raise ValueError("live execution requires --implementation-revision")
+    root = repository_root or Path(__file__).resolve().parents[1]
+    revision = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    status = subprocess.run(
+        ["git", "-C", str(root), "status", "--porcelain", "--untracked-files=all"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if revision.returncode or status.returncode:
+        raise ValueError("live execution requires a readable Git checkout")
+    actual_revision = revision.stdout.strip()
+    if actual_revision != expected_revision:
+        raise ValueError("implementation revision does not match the live checkout")
+    if status.stdout.strip():
+        raise ValueError("live execution requires a clean Git checkout")
+    return actual_revision
+
+
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="LuxPower critical energy-flow profile READ-ONLY validation"
     )
     parser.add_argument("--confirm-read-only", action="store_true")
+    parser.add_argument(
+        "--implementation-revision",
+        type=_parse_implementation_revision,
+    )
     parser.add_argument("--pv-strings", type=_parse_pv_strings, required=True)
     parser.add_argument(
         "--grid-topology",
@@ -708,6 +1027,9 @@ def build_argument_parser() -> argparse.ArgumentParser:
 async def _async_main(arguments: argparse.Namespace) -> int:
     if not arguments.confirm_read_only:
         raise ValueError("live execution requires --confirm-read-only")
+    implementation_revision = _verify_live_source_revision(
+        arguments.implementation_revision
+    )
     host, port, dongle, inverter = _load_private_target(os.environ)
     profile = EnergyFlowReadProfile(
         active_pv_strings=arguments.pv_strings,
@@ -740,6 +1062,8 @@ async def _async_main(arguments: argparse.Namespace) -> int:
         short_seconds=arguments.short_seconds,
         burn_seconds=arguments.burn_seconds,
         forced_samples=arguments.forced_samples,
+        implementation_revision=implementation_revision,
+        implementation_revision_verified=True,
     )
     report["profile"]["capability_provenance"] = arguments.capability_provenance
     serialized = json.dumps(report, indent=2, sort_keys=True)
