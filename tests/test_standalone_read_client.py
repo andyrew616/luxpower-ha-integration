@@ -1,6 +1,7 @@
 """Tests for the supported Home Assistant-independent read client."""
 
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 import subprocess
 import sys
@@ -14,6 +15,8 @@ from luxpower import (
     LuxPowerCommunicationError,
     LuxPowerReadClient,
     LuxPowerTelemetry,
+    TelemetryGroup,
+    input_register_group,
 )
 
 
@@ -46,7 +49,7 @@ def reject_home_assistant(name, *args, **kwargs):
     return real_import(name, *args, **kwargs)
 
 builtins.__import__ = reject_home_assistant
-from luxpower import LuxPowerReadClient, LuxPowerTelemetry
+from luxpower import LuxPowerReadClient, LuxPowerTelemetry, TelemetryGroup, input_register_group
 client = LuxPowerReadClient(
     host="192.0.2.1",
     port=8000,
@@ -54,6 +57,7 @@ client = LuxPowerReadClient(
     inverter_serial="0000000001",
 )
 assert LuxPowerTelemetry is not None
+assert input_register_group(0) is TelemetryGroup.OPERATIONAL
 assert hasattr(client, "async_read")
 client._client.async_get_data = AsyncMock(
     return_value={"input": {0: 1}, "hold": {0: 2}, "battery": {}}
@@ -89,7 +93,11 @@ def test_read_client_exposes_no_write_operation():
 @pytest.mark.asyncio
 async def test_read_client_returns_typed_telemetry_using_existing_poll_path():
     """Read decoded data through a fake transport without bypassing poll cadence."""
-    client = make_client(block_size=375)
+    observed = iter([
+        datetime(2026, 1, 2, 10, 0, second, tzinfo=timezone.utc)
+        for second in range(4)
+    ])
+    client = make_client(block_size=375, clock=lambda: next(observed))
     reader = AsyncMock()
     writer = MagicMock()
     writer.wait_closed = AsyncMock()
@@ -117,6 +125,15 @@ async def test_read_client_returns_typed_telemetry_using_existing_poll_path():
         holding_registers={0: 2000, 375: 2375},
         batteries={},
     )
+    assert telemetry.observed_at.input_registers == {
+        0: datetime(2026, 1, 2, 10, 0, 0, tzinfo=timezone.utc),
+        375: datetime(2026, 1, 2, 10, 0, 1, tzinfo=timezone.utc),
+    }
+    assert telemetry.observed_at.holding_registers == {
+        0: datetime(2026, 1, 2, 10, 0, 2, tzinfo=timezone.utc),
+        375: datetime(2026, 1, 2, 10, 0, 3, tzinfo=timezone.utc),
+    }
+    assert telemetry.grouped_input_registers()[TelemetryGroup.OPERATIONAL][0] == 1000
     assert requests.await_args_list == [
         call(writer, reader, 0, "input", 4),
         call(writer, reader, 375, "input", 4),

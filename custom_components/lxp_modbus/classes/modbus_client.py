@@ -1,7 +1,9 @@
 """Modbus API client for communicating with LuxPower inverters."""
 import asyncio
+from datetime import datetime
 import logging
 import time as time_lib
+from typing import Callable
 
 from ..const import (
     BATTERY_BACKOFF_POLL_EVERY,
@@ -23,6 +25,7 @@ from ..const import (
 )
 from ..constants.input_registers import I_BAT_PARALLEL_NUM
 from ..exceptions import LuxPowerCommunicationError
+from ..observation import LuxPowerObservationTimes, require_aware_utc, utc_now
 from .connection_manager import ModbusConnectionManager
 from .data_validator import is_data_sane
 from .lxp_batteries import LxpBatteries
@@ -48,7 +51,8 @@ class LxpModbusApiClient:
     def __init__(self, host: str, port: int, dongle_serial: str, inverter_serial: str, lock: asyncio.Lock,
                  block_size: int = 125, connection_retries: int = DEFAULT_CONNECTION_RETRIES,
                  skip_initial_data: bool = True, request_battery_data: bool = False,
-                 battery_serials_configured: bool = False):
+                 battery_serials_configured: bool = False,
+                 clock: Callable[[], datetime] | None = None):
         """Initialize the API client."""
         self._dongle_serial = dongle_serial
         self._inverter_serial = inverter_serial
@@ -62,6 +66,10 @@ class LxpModbusApiClient:
         self._last_good_input_regs = {}
         self._last_good_hold_regs = {}
         self._last_good_battery_data = {}
+        self._input_observed_at = {}
+        self._hold_observed_at = {}
+        self._battery_observed_at = {}
+        self._clock = clock or utc_now
         self._connection_retry_count = 0
         self._last_successful_connection = None
         self._connection_failure_count = 0
@@ -225,6 +233,34 @@ class LxpModbusApiClient:
             "battery": {serial: dict(regs) for serial, regs in self._last_good_battery_data.items()},
         }
 
+    def get_observation_times(self) -> LuxPowerObservationTimes:
+        """Return detached per-value times matching the current known-good cache."""
+        return LuxPowerObservationTimes(
+            input_registers={
+                register: self._input_observed_at[register]
+                for register in self._last_good_input_regs
+                if register in self._input_observed_at
+            },
+            holding_registers={
+                register: self._hold_observed_at[register]
+                for register in self._last_good_hold_regs
+                if register in self._hold_observed_at
+            },
+            batteries={
+                serial: {
+                    register: self._battery_observed_at[serial][register]
+                    for register in registers
+                    if (serial in self._battery_observed_at
+                        and register in self._battery_observed_at[serial])
+                }
+                for serial, registers in self._last_good_battery_data.items()
+            },
+        )
+
+    def _observed_now(self) -> datetime:
+        """Read and validate the local observation clock at an acceptance point."""
+        return require_aware_utc(self._clock())
+
     def _last_success_description(self) -> str:
         """Describe how long ago the last successful connection was."""
         if not self._last_successful_connection:
@@ -275,6 +311,9 @@ class LxpModbusApiClient:
         newly_polled_input_regs = {}
         newly_polled_hold_regs = {}
         newly_polled_battery_data = {}
+        newly_observed_input_at = {}
+        newly_observed_hold_at = {}
+        newly_observed_battery_at = {}
         writer = None
 
         poll_hold = self._should_poll_hold()
@@ -290,6 +329,10 @@ class LxpModbusApiClient:
                         reg_block = await self.async_request_registers(writer, reader, reg, "input", 4)
                         if len(reg_block) > 0:
                             newly_polled_input_regs.update(reg_block)
+                            observed_at = self._observed_now()
+                            newly_observed_input_at.update(
+                                {register: observed_at for register in reg_block}
+                            )
 
                     # Poll battery data if enabled and inverter reports connected batteries
                     # The decoding routine needs 120 registers for complete block processing
@@ -304,6 +347,14 @@ class LxpModbusApiClient:
                                 bat_block = await self.async_request_registers(
                                     writer, reader, reg, "input/bat", 4)
                                 newly_polled_battery_data.update(bat_block)
+                                if bat_block:
+                                    observed_at = self._observed_now()
+                                    newly_observed_battery_at.update({
+                                        serial: {
+                                            register: observed_at for register in registers
+                                        }
+                                        for serial, registers in bat_block.items()
+                                    })
                             self._record_battery_result(bool(newly_polled_battery_data))
                         else:
                             self._battery_skipped_polls += 1
@@ -315,6 +366,10 @@ class LxpModbusApiClient:
                             reg_block = await self.async_request_registers(writer, reader, reg, "hold", 3)
                             if len(reg_block) > 0:
                                 newly_polled_hold_regs.update(reg_block)
+                                observed_at = self._observed_now()
+                                newly_observed_hold_at.update(
+                                    {register: observed_at for register in reg_block}
+                                )
                         self._hold_polls += 1
 
                 except asyncio.TimeoutError:
@@ -325,12 +380,15 @@ class LxpModbusApiClient:
         # Merge new data with the last known good data
         if len(newly_polled_input_regs):
             self._last_good_input_regs.update(newly_polled_input_regs)
+            self._input_observed_at.update(newly_observed_input_at)
 
         if len(newly_polled_battery_data):
             self._last_good_battery_data.update(newly_polled_battery_data)
+            self._battery_observed_at.update(newly_observed_battery_at)
 
         if len(newly_polled_hold_regs):
             self._last_good_hold_regs.update(newly_polled_hold_regs)
+            self._hold_observed_at.update(newly_observed_hold_at)
 
     def _handle_poll_failure(self, error: Exception | None) -> dict:
         """Decide what to report after every connection attempt failed.
@@ -463,8 +521,11 @@ class LxpModbusApiClient:
             if received_value == value:
                 _LOGGER.info("Successfully wrote register %s with value %s.", register, value)
                 # The acknowledgement echoes what the inverter stored, so the cache
-                # can hold a confirmed value without waiting for any read.
+                # can hold a confirmed value without waiting for any read.  It is
+                # not itself a holding-register read, so any timestamp belonging to
+                # the replaced value is no longer truthful until readback succeeds.
                 self._last_good_hold_regs[register] = received_value
+                self._hold_observed_at.pop(register, None)
                 return True
 
             _LOGGER.warning("Write attempt %s failed: Confirmation mismatch, sent=%s received=%s",
@@ -495,6 +556,10 @@ class LxpModbusApiClient:
 
         if reg_block:
             self._last_good_hold_regs.update(reg_block)
+            observed_at = self._observed_now()
+            self._hold_observed_at.update(
+                {read_register: observed_at for read_register in reg_block}
+            )
             return
 
         _LOGGER.debug("Post-write re-read of hold block %s returned nothing; "

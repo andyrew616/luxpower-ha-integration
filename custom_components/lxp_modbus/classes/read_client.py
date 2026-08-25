@@ -1,7 +1,7 @@
 """Home Assistant-independent, read-only LuxPower client API."""
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Mapping
 
 from ..const import (
@@ -9,6 +9,8 @@ from ..const import (
     DEFAULT_PORT,
     DEFAULT_REGISTER_BLOCK_SIZE,
 )
+from ..observation import LuxPowerObservationTimes, ObservationClock
+from ..telemetry_groups import TelemetryGroup, group_input_registers
 from .modbus_client import LxpModbusApiClient
 
 RegisterMap = Mapping[int, int]
@@ -22,9 +24,17 @@ class LuxPowerTelemetry:
     input_registers: RegisterMap
     holding_registers: RegisterMap
     batteries: Mapping[str, BatteryRegisterMap]
+    observed_at: LuxPowerObservationTimes = field(
+        default_factory=LuxPowerObservationTimes,
+        compare=False,
+    )
 
     @classmethod
-    def from_register_data(cls, data: dict) -> "LuxPowerTelemetry":
+    def from_register_data(
+        cls,
+        data: dict,
+        observed_at: LuxPowerObservationTimes | None = None,
+    ) -> "LuxPowerTelemetry":
         """Create a detached telemetry snapshot from the protocol client's data."""
         return cls(
             input_registers=dict(data.get("input", {})),
@@ -33,7 +43,12 @@ class LuxPowerTelemetry:
                 serial: dict(registers)
                 for serial, registers in data.get("battery", {}).items()
             },
+            observed_at=(observed_at or LuxPowerObservationTimes()).detached_copy(),
         )
+
+    def grouped_input_registers(self) -> dict[TelemetryGroup, dict[int, int]]:
+        """Return all input values grouped by documented semantics."""
+        return group_input_registers(self.input_registers)
 
 
 class LuxPowerReadClient:
@@ -57,6 +72,7 @@ class LuxPowerReadClient:
         skip_initial_data: bool = True,
         request_battery_data: bool = False,
         battery_serials_configured: bool = False,
+        clock: ObservationClock | None = None,
     ) -> None:
         """Initialize a read-only client for one LuxPower inverter."""
         self._client = LxpModbusApiClient(
@@ -70,9 +86,13 @@ class LuxPowerReadClient:
             skip_initial_data=skip_initial_data,
             request_battery_data=request_battery_data,
             battery_serials_configured=battery_serials_configured,
+            clock=clock,
         )
 
     async def async_read(self) -> LuxPowerTelemetry:
         """Poll the inverter once and return a decoded telemetry snapshot."""
         data = await self._client.async_get_data()
-        return LuxPowerTelemetry.from_register_data(data)
+        return LuxPowerTelemetry.from_register_data(
+            data,
+            observed_at=self._client.get_observation_times(),
+        )
