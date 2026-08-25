@@ -190,6 +190,7 @@ async def test_diagnostics_exclude_private_target_and_raw_packet_data():
     assert "TESTINV001" not in serialized
     assert "packet" not in serialized.lower()
     assert "values" not in serialized.lower()
+    assert "target_mismatch" not in serialized
     await session.async_close()
 
 
@@ -209,7 +210,7 @@ def test_diagnostic_records_independent_phase_budgets():
 
     request = journal.finalize_request(state, LuxReadRequestOutcome.SUCCESS)
 
-    assert journal.snapshot().schema_version == 2
+    assert journal.snapshot().schema_version == 3
     assert request.timeout_budget_ms == 10000
     assert request.drain_timeout_budget_ms == 1000
     assert request.reply_timeout_budget_ms == 10000

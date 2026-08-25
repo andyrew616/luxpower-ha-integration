@@ -58,6 +58,26 @@ class LuxDiagnosticEventKind(str, Enum):
     REQUEST_TERMINAL = "request_terminal"
 
 
+class LuxInvalidFrameReason(str, Enum):
+    """Sanitized rejection reason which never includes packet content."""
+
+    MALFORMED_LENGTH = "malformed_length"
+    PARTIAL_FRAME_TIMEOUT = "partial_frame_timeout"
+    PACKET_INTEGRITY = "packet_integrity"
+    TCP_FUNCTION = "tcp_function"
+    DONGLE_TARGET_MISMATCH = "dongle_target_mismatch"
+    INVERTER_TARGET_MISMATCH = "inverter_target_mismatch"
+    DEVICE_FUNCTION = "device_function"
+    MODBUS_EXCEPTION = "modbus_exception"
+    EMPTY_VALUES = "empty_values"
+    ADDRESS_ACTION = "address_action"
+    DATA_LENGTH = "data_length"
+    VALUE_LENGTH = "value_length"
+    NONCONTIGUOUS_REGISTERS = "noncontiguous_registers"
+    REGISTER_RANGE = "register_range"
+    DATA_SANITY = "data_sanity"
+
+
 @dataclass(frozen=True)
 class LuxReadRequestContext:
     """Optional profile state supplied without coupling transport to the profile."""
@@ -85,6 +105,7 @@ class LuxReadDiagnosticEvent:
     request_sequence: int | None = None
     register_start: int | None = None
     register_count: int | None = None
+    classification: str | None = None
 
 
 @dataclass(frozen=True)
@@ -206,7 +227,7 @@ class _DiagnosticRequestState:
 class LuxReadDiagnosticJournal:
     """Non-blocking bounded journal which never stores packets or register values."""
 
-    SCHEMA_VERSION = 2
+    SCHEMA_VERSION = 3
 
     def __init__(
         self,
@@ -264,6 +285,7 @@ class LuxReadDiagnosticJournal:
         request: _DiagnosticRequestState | None = None,
         register_start: int | None = None,
         register_count: int | None = None,
+        classification: str | None = None,
         at: float | None = None,
     ) -> LuxReadDiagnosticEvent:
         observed = self.now() if at is None else at
@@ -276,6 +298,7 @@ class LuxReadDiagnosticJournal:
             request_sequence=(request.request_sequence if request else None),
             register_start=register_start,
             register_count=register_count,
+            classification=classification,
         )
         self._events.append(event)
         return event
@@ -460,6 +483,7 @@ class LuxReadDiagnosticJournal:
         self,
         generation: int,
         pending: _DiagnosticRequestState | None,
+        reason: LuxInvalidFrameReason,
     ) -> None:
         if pending is not None:
             pending.invalid_frames_while_pending += 1
@@ -467,6 +491,7 @@ class LuxReadDiagnosticJournal:
             LuxDiagnosticEventKind.INVALID_FRAME,
             generation,
             request=pending,
+            classification=reason.value,
         )
 
     def mark_generation_invalidated(self, state: _DiagnosticRequestState) -> None:

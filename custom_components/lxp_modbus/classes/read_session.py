@@ -30,6 +30,7 @@ from ..observation import (
 from ..telemetry_groups import TelemetryGroup, input_register_group
 from ..timeout_diagnostics import (
     LuxDiagnosticEventKind,
+    LuxInvalidFrameReason,
     LuxReadDiagnosticJournal,
     LuxReadDiagnosticsSnapshot,
     LuxReadRequestContext,
@@ -672,6 +673,7 @@ class LuxReadSession:
                             self._diagnostics.observe_invalid(
                                 generation,
                                 self._pending_diagnostic(generation),
+                                LuxInvalidFrameReason.PARTIAL_FRAME_TIMEOUT,
                             )
                         continue
                 else:
@@ -691,6 +693,7 @@ class LuxReadSession:
                     self._diagnostics.observe_invalid(
                         generation,
                         self._pending_diagnostic(generation),
+                        LuxInvalidFrameReason.MALFORMED_LENGTH,
                     )
                 for frame in frames:
                     self._route_frame(frame, generation)
@@ -777,6 +780,12 @@ class LuxReadSession:
             self._diagnostics.observe_invalid(
                 generation,
                 self._pending_diagnostic(generation),
+                self._invalid_frame_reason(
+                    response,
+                    values,
+                    count,
+                    contiguous,
+                ),
             )
             return
 
@@ -849,6 +858,43 @@ class LuxReadSession:
                 input_register_group(register) is TelemetryGroup.OPERATIONAL
                 for register in values
             )
+
+    def _invalid_frame_reason(
+        self,
+        response: LxpResponse,
+        values: Mapping[int, int],
+        count: int,
+        contiguous: bool,
+    ) -> LuxInvalidFrameReason:
+        """Classify a rejected frame without exposing packet or value content."""
+        if response.packet_error:
+            return LuxInvalidFrameReason.PACKET_INTEGRITY
+        if response.tcp_function != _LxpRequestBuilder.TRANSLATED_DATA:
+            return LuxInvalidFrameReason.TCP_FUNCTION
+        if response.dongle_serial != self._dongle_serial:
+            return LuxInvalidFrameReason.DONGLE_TARGET_MISMATCH
+        if response.serial_number != self._inverter_serial:
+            return LuxInvalidFrameReason.INVERTER_TARGET_MISMATCH
+        if response.device_function != READ_INPUT_FUNCTION_CODE:
+            return LuxInvalidFrameReason.DEVICE_FUNCTION
+        if response.exception:
+            return LuxInvalidFrameReason.MODBUS_EXCEPTION
+        if not values:
+            return LuxInvalidFrameReason.EMPTY_VALUES
+        if response.address_action != 1:
+            return LuxInvalidFrameReason.ADDRESS_ACTION
+        if response.data_length != response.frame_length - 14:
+            return LuxInvalidFrameReason.DATA_LENGTH
+        if (
+            response.value_length != count * 2
+            or len(response.value) != response.value_length
+        ):
+            return LuxInvalidFrameReason.VALUE_LENGTH
+        if not contiguous:
+            return LuxInvalidFrameReason.NONCONTIGUOUS_REGISTERS
+        if response.register < 0 or response.register + count > 750:
+            return LuxInvalidFrameReason.REGISTER_RANGE
+        return LuxInvalidFrameReason.DATA_SANITY
 
     def _publish_observation(self, observation: LuxReadObservation) -> None:
         if self._observations.full():

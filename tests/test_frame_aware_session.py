@@ -280,6 +280,18 @@ async def test_wrong_targets_function_and_envelope_never_refresh_telemetry():
 
     assert session.metrics().invalid_frames == 5
     assert session.snapshot().input_registers == {}
+    reasons = [
+        event.classification
+        for event in session.diagnostics().events
+        if event.kind.value == "invalid_frame"
+    ]
+    assert reasons == [
+        "inverter_target_mismatch",
+        "dongle_target_mismatch",
+        "device_function",
+        "address_action",
+        "data_length",
+    ]
     await session.async_close()
 
 

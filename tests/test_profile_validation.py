@@ -523,7 +523,7 @@ async def test_short_only_schema_v5_provenance_and_intentional_shutdown_health()
         "implementation_revision": "a" * 40,
         "revision_source": "operator_supplied",
         "profile_definition_version": 1,
-        "diagnostic_schema_version": 2,
+        "diagnostic_schema_version": 3,
         "run_mode": "critical_profile_timeout_diagnostics",
         "request_timeout_seconds": 3,
         "drain_timeout_seconds": 3,
