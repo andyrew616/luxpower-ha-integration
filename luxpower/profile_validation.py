@@ -23,10 +23,11 @@ from custom_components.lxp_modbus.read_profiles import (
     LoadLayout,
     profile_block_details,
 )
+from custom_components.lxp_modbus.recovery import RecoveryPolicy
 from luxpower.hybrid import LuxPowerHybridReadClient, _metrics_delta
 
-PROFILE_VALIDATION_SCHEMA_VERSION = 1
-PROFILE_VALIDATION_VERSION = "1.0"
+PROFILE_VALIDATION_SCHEMA_VERSION = 3
+PROFILE_VALIDATION_VERSION = "3.0"
 
 
 def _nearest_rank_p95(values: Sequence[float]) -> float | None:
@@ -34,6 +35,14 @@ def _nearest_rank_p95(values: Sequence[float]) -> float | None:
         return None
     ordered = sorted(values)
     return ordered[max(0, math.ceil(len(ordered) * 0.95) - 1)]
+
+
+def _nearest_rank_p99(values: Sequence[float]) -> float | None:
+    """Return p99 only when at least 100 samples support that claim."""
+    if len(values) < 100:
+        return None
+    ordered = sorted(values)
+    return ordered[max(0, math.ceil(len(ordered) * 0.99) - 1)]
 
 
 def summarize_profile_samples(samples: Sequence[Mapping[str, object]]) -> dict:
@@ -54,6 +63,7 @@ def summarize_profile_samples(samples: Sequence[Mapping[str, object]]) -> dict:
         "complete_samples": len(complete),
         "median_worst_age_seconds": round(statistics.median(ages), 3) if ages else None,
         "p95_worst_age_seconds": round(_nearest_rank_p95(ages), 3) if ages else None,
+        "p99_worst_age_seconds": round(_nearest_rank_p99(ages), 3) if len(ages) >= 100 else None,
         "max_worst_age_seconds": round(max(ages), 3) if ages else None,
         "worst_register_sample_counts": outliers,
     }
@@ -79,6 +89,89 @@ def _time_beyond_target(
     return total
 
 
+def _time_beyond_target_by_health_state(
+    samples: Sequence[Mapping[str, object]], target_seconds: float
+) -> dict[str, float]:
+    """Partition stale time by instantaneous state without claiming causality."""
+    totals = {"while_recovering": 0.0, "outside_recovering": 0.0}
+    for current, following in zip(samples, samples[1:]):
+        freshness = current["profile_freshness"]
+        stale = bool(
+            freshness["max_age_seconds"] is None
+            or freshness["known"] != freshness["required"]
+            or freshness["max_age_seconds"] > target_seconds
+        )
+        if not stale:
+            continue
+        bucket = (
+            "while_recovering"
+            if current.get("acquisition_health") == "recovering"
+            else "outside_recovering"
+        )
+        totals[bucket] += (
+            datetime.fromisoformat(following["at"])
+            - datetime.fromisoformat(current["at"])
+        ).total_seconds()
+    return {name: round(value, 3) for name, value in totals.items()}
+
+
+def _time_beyond_target_by_recovery_episode(
+    samples: Sequence[Mapping[str, object]],
+    target_seconds: float,
+    recovery_events: Sequence[Mapping[str, object]],
+) -> dict[str, float]:
+    """Causally attribute stale intervals from failed request start to recovery end."""
+    episodes = tuple(
+        (
+            datetime.fromisoformat(str(event["episode_started_at"])),
+            datetime.fromisoformat(str(event["ended_at"])),
+        )
+        for event in recovery_events
+    )
+    totals = {"recovery_episode": 0.0, "normal_operation": 0.0}
+    for current, following in zip(samples, samples[1:]):
+        freshness = current["profile_freshness"]
+        stale = bool(
+            freshness["max_age_seconds"] is None
+            or freshness["known"] != freshness["required"]
+            or freshness["max_age_seconds"] > target_seconds
+        )
+        if not stale:
+            continue
+        started = datetime.fromisoformat(str(current["at"]))
+        bucket = (
+            "recovery_episode"
+            if any(episode_start <= started <= episode_end for episode_start, episode_end in episodes)
+            else "normal_operation"
+        )
+        totals[bucket] += (
+            datetime.fromisoformat(str(following["at"])) - started
+        ).total_seconds()
+    return {name: round(value, 3) for name, value in totals.items()}
+
+
+def _recovery_metrics_delta(before, after) -> dict:
+    fields = (
+        "timeout_count",
+        "connection_loss_count",
+        "connection_establishment_failure_count",
+        "ambiguous_request_count",
+        "reconnect_attempts",
+        "successful_reconnects",
+        "failed_reconnects",
+        "completed_recoveries",
+        "retry_budget_exhausted",
+        "acquisitions_abandoned",
+        "connection_generations_created",
+    )
+    result = {name: getattr(after, name) - getattr(before, name) for name in fields}
+    result["events"] = [
+        asdict(event) for event in after.events[len(before.events):]
+    ]
+    result["final_health"] = after.health.value
+    return result
+
+
 async def _run_profile_phase(
     client: LuxPowerHybridReadClient,
     *,
@@ -88,6 +181,7 @@ async def _run_profile_phase(
 ) -> dict:
     before_session = client.metrics()
     before_profile = client.profile_metrics()
+    before_recovery = client.recovery_metrics()
     samples: list[dict] = []
     error = None
     started = time.monotonic()
@@ -98,6 +192,7 @@ async def _run_profile_phase(
     actual_duration = time.monotonic() - started
     after_session = client.metrics()
     after_profile = client.profile_metrics()
+    after_recovery = client.recovery_metrics()
     session_delta = _metrics_delta(before_session, after_session)
     attempted = (
         after_profile.explicit_requests_attempted
@@ -118,11 +213,25 @@ async def _run_profile_phase(
     unsafe_events = sum(
         session_delta[field]
         for field in (
-            "request_timeouts",
-            "connection_losses",
             "invalid_frames",
             "observation_queue_drops",
         )
+    )
+    recovery_delta = _recovery_metrics_delta(before_recovery, after_recovery)
+    recovery_safe = bool(
+        not error
+        and not unsafe_events
+        and recovery_delta["failed_reconnects"] == 0
+        and recovery_delta["retry_budget_exhausted"] == 0
+        and all(
+            event["outcome"] == "profile_recovered"
+            for event in recovery_delta["events"]
+        )
+    )
+    freshness_met = bool(samples and not violations)
+    stale_by_health = _time_beyond_target_by_health_state(samples, target_seconds)
+    stale_by_episode = _time_beyond_target_by_recovery_episode(
+        samples, target_seconds, recovery_delta["events"]
     )
     return {
         "name": name,
@@ -137,6 +246,7 @@ async def _run_profile_phase(
             else None
         ),
         "session_metrics": session_delta,
+        "recovery_metrics": recovery_delta,
         "profile_source_metrics": {
             "explicit_requests_attempted": attempted,
             "explicit_requests_per_minute": round(
@@ -155,7 +265,11 @@ async def _run_profile_phase(
         "sampled_time_beyond_target_seconds": round(
             _time_beyond_target(samples, target_seconds), 3
         ),
-        "target_met": bool(samples and not error and not unsafe_events and not violations),
+        "sampled_time_beyond_target_by_health_state_seconds": stale_by_health,
+        "sampled_time_beyond_target_attribution_seconds": stale_by_episode,
+        "transport_recovery_safe": recovery_safe,
+        "freshness_target_met": freshness_met,
+        "target_met": bool(recovery_safe and freshness_met),
     }
 
 
@@ -196,6 +310,11 @@ async def execute_profile_validation(
             "required_registers": sorted(client.profile.required_registers),
             "blocks": list(profile_block_details(client.profile)),
         },
+        "recovery_policy": (
+            asdict(client.recovery_policy)
+            if client.recovery_policy is not None
+            else None
+        ),
         "phases": [],
     }
     await client.async_connect()
@@ -271,6 +390,7 @@ async def execute_profile_validation(
         await client.async_close()
     report["final_session_metrics"] = asdict(client.metrics())
     report["final_profile_metrics"] = asdict(client.profile_metrics())
+    report["final_recovery_metrics"] = asdict(client.recovery_metrics())
     report["completed_at"] = utc_now().isoformat()
     return report
 
@@ -331,6 +451,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--short-runs", type=int, default=2)
     parser.add_argument("--short-seconds", type=float, default=30)
     parser.add_argument("--burn-seconds", type=float, default=180)
+    parser.add_argument("--enable-recovery", action="store_true")
+    parser.add_argument("--recovery-window-seconds", type=float, default=300)
+    parser.add_argument("--recovery-window-attempts", type=int, default=2)
+    parser.add_argument("--recovery-initial-cooldown", type=float, default=1)
+    parser.add_argument("--recovery-repeated-cooldown", type=float, default=5)
     parser.add_argument("--output", type=Path)
     return parser
 
@@ -344,8 +469,24 @@ async def _async_main(arguments: argparse.Namespace) -> int:
         grid_topology=arguments.grid_topology,
         load_layout=arguments.load_layout,
     )
+    recovery_policy = (
+        RecoveryPolicy(
+            max_reconnects_per_acquisition=1,
+            max_reconnects_per_window=arguments.recovery_window_attempts,
+            rolling_window_seconds=arguments.recovery_window_seconds,
+            initial_cooldown_seconds=arguments.recovery_initial_cooldown,
+            repeated_cooldown_seconds=arguments.recovery_repeated_cooldown,
+        )
+        if arguments.enable_recovery
+        else None
+    )
     client = LuxPowerHybridReadClient(
-        host, dongle, inverter, port=port, profile=profile
+        host,
+        dongle,
+        inverter,
+        port=port,
+        profile=profile,
+        recovery_policy=recovery_policy,
     )
     report = await execute_profile_validation(
         client,

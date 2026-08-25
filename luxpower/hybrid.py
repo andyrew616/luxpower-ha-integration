@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from collections import deque
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 import json
@@ -21,12 +22,28 @@ from custom_components.lxp_modbus.classes.read_session import (
     LuxReadSessionSnapshot,
 )
 from custom_components.lxp_modbus.const import TOTAL_REGISTERS
-from custom_components.lxp_modbus.exceptions import LuxPowerCommunicationError
+from custom_components.lxp_modbus.exceptions import (
+    LuxPowerAmbiguousRequestError,
+    LuxPowerCommunicationError,
+    LuxPowerConnectionError,
+    LuxPowerConnectionLostError,
+    LuxPowerReadRejectedError,
+    LuxPowerReadTimeoutError,
+    LuxPowerRecoveryExhaustedError,
+    LuxPowerSessionClosedError,
+)
 from custom_components.lxp_modbus.observation import utc_now
 from custom_components.lxp_modbus.read_profiles import (
     EnergyFlowReadProfile,
     EnergyFlowSnapshot,
     InputReadBlock,
+)
+from custom_components.lxp_modbus.recovery import (
+    AcquisitionHealth,
+    RecoveryEvent,
+    RecoveryFailureKind,
+    RecoveryMetrics,
+    RecoveryPolicy,
 )
 from custom_components.lxp_modbus.telemetry_groups import (
     TelemetryGroup,
@@ -104,6 +121,17 @@ class HybridProfileMetrics:
         return 100 * self.explicit_requests_avoided_unsolicited / opportunities
 
 
+@dataclass
+class _ActiveRecovery:
+    failure_kind: RecoveryFailureKind
+    block: InputReadBlock
+    started_monotonic: float
+    episode_started_at: str
+    cooldown_seconds: float
+    failure_to_connection_seconds: float | None = None
+    maximum_profile_age_seconds: float | None = None
+
+
 class LuxPowerHybridReadClient:
     """Experimental persistent FC4 client with freshness-driven read suppression.
 
@@ -121,6 +149,8 @@ class LuxPowerHybridReadClient:
         full_scan_interval: timedelta = timedelta(seconds=60),
         profile: EnergyFlowReadProfile | None = None,
         session: LuxReadSession | None = None,
+        recovery_policy: RecoveryPolicy | None = None,
+        monotonic=time.monotonic,
     ) -> None:
         if freshness_target.total_seconds() <= 0:
             raise ValueError("freshness_target must be positive")
@@ -135,6 +165,8 @@ class LuxPowerHybridReadClient:
         self._freshness_target = freshness_target
         self._full_scan_interval = full_scan_interval
         self._profile = profile
+        self._recovery_policy = recovery_policy
+        self._monotonic = monotonic
         self._last_full_scan_completed_at: datetime | None = None
         self._profile_explicit_requests = 0
         self._profile_unsolicited_avoided = 0
@@ -142,11 +174,40 @@ class LuxPowerHybridReadClient:
             InputReadBlock, tuple[datetime, ...]
         ] = {}
         self._last_profile_request_block: InputReadBlock | None = None
+        self._profile_refresh_lock = asyncio.Lock()
+        self._shutdown = asyncio.Event()
+        self._shutdown.set()
+        self._health = AcquisitionHealth.DEGRADED
+        self._reconnect_attempt_times: deque[float] = deque()
+        self._recovery_events: list[RecoveryEvent] = []
+        self._active_recovery: _ActiveRecovery | None = None
+        self._timeout_count = 0
+        self._connection_loss_count = 0
+        self._connection_establishment_failure_count = 0
+        self._ambiguous_request_count = 0
+        self._reconnect_attempts = 0
+        self._successful_reconnects = 0
+        self._failed_reconnects = 0
+        self._completed_recoveries = 0
+        self._retry_budget_exhausted = 0
+        self._acquisitions_abandoned = 0
 
     async def async_connect(self) -> None:
-        await self._session.async_connect()
+        self._shutdown.clear()
+        try:
+            await self._session.async_connect()
+        except BaseException:
+            self._health = AcquisitionHealth.DEGRADED
+            raise
+        self._health = (
+            AcquisitionHealth.DEGRADED
+            if self._profile is not None
+            else AcquisitionHealth.HEALTHY
+        )
 
     async def async_close(self) -> None:
+        self._shutdown.set()
+        self._health = AcquisitionHealth.DEGRADED
         await self._session.async_close()
 
     async def async_passive(self, seconds: float) -> None:
@@ -166,6 +227,11 @@ class LuxPowerHybridReadClient:
         """The resolved experimental profile, if configured."""
         return self._profile
 
+    @property
+    def recovery_policy(self) -> RecoveryPolicy | None:
+        """The opt-in sanitized recovery policy, if configured."""
+        return self._recovery_policy
+
     def profile_snapshot(self) -> EnergyFlowSnapshot:
         """Return a typed profile snapshot with truthful derived freshness."""
         if self._profile is None:
@@ -177,6 +243,31 @@ class LuxPowerHybridReadClient:
             explicit_requests_attempted=self._profile_explicit_requests,
             explicit_requests_avoided_unsolicited=self._profile_unsolicited_avoided,
             blocks_satisfied_unsolicited=self._profile_unsolicited_avoided,
+        )
+
+    @property
+    def acquisition_health(self) -> AcquisitionHealth:
+        """Current experimental acquisition health without altering values."""
+        return self._health
+
+    def recovery_metrics(self) -> RecoveryMetrics:
+        """Return detached sanitized bounded-recovery metrics."""
+        return RecoveryMetrics(
+            health=self._health,
+            timeout_count=self._timeout_count,
+            connection_loss_count=self._connection_loss_count,
+            connection_establishment_failure_count=(
+                self._connection_establishment_failure_count
+            ),
+            ambiguous_request_count=self._ambiguous_request_count,
+            reconnect_attempts=self._reconnect_attempts,
+            successful_reconnects=self._successful_reconnects,
+            failed_reconnects=self._failed_reconnects,
+            completed_recoveries=self._completed_recoveries,
+            retry_budget_exhausted=self._retry_budget_exhausted,
+            acquisitions_abandoned=self._acquisitions_abandoned,
+            connection_generations_created=self._session.metrics().connections,
+            events=tuple(self._recovery_events),
         )
 
     @property
@@ -217,75 +308,400 @@ class LuxPowerHybridReadClient:
         """Refresh only stale registers required by the configured profile."""
         if self._profile is None:
             raise ValueError("no read profile configured")
-        started = time.monotonic()
+        async with self._profile_refresh_lock:
+            return await self._async_refresh_profile_locked()
+
+    async def _async_refresh_profile_locked(self) -> HybridProfileRefreshResult:
+        started = self._monotonic()
         requested: list[InputReadBlock] = []
         skipped: list[InputReadBlock] = []
         unsolicited: list[InputReadBlock] = []
-        for block in self._profile.read_blocks:
-            snapshot = self._session.snapshot()
-            now = utc_now()
-            required = self._profile.required_registers_in(block)
-            fresh = self._required_registers_are_fresh(required, snapshot, now)
-            observations = snapshot.observed_at.input_registers
-            signature = (
-                tuple(observations[register] for register in sorted(required))
-                if all(register in observations for register in required)
-                else None
-            )
-            accounted = self._profile_accounted_observations.get(block)
-            if accounted is None and all(
-                register in snapshot.explicit_observed_at for register in required
-            ):
-                accounted = tuple(
-                    snapshot.explicit_observed_at[register]
-                    for register in sorted(required)
-                )
-                self._profile_accounted_observations[block] = accounted
-            opportunity_due = bool(
-                accounted is None
-                or now - min(accounted) >= self._freshness_target
-            )
-            if fresh:
-                skipped.append(block)
-                if opportunity_due and signature is not None and signature != accounted:
-                    due_indexes = (
-                        tuple(range(len(signature)))
-                        if accounted is None
-                        else tuple(
-                            index
-                            for index, observed in enumerate(accounted)
-                            if now - observed >= self._freshness_target
+        reconnects = 0
+        active_recovery: _ActiveRecovery | None = None
+        restart_selection = True
+        while restart_selection:
+            restart_selection = False
+            for block in self._profile.read_blocks:
+                required = self._profile.required_registers_in(block)
+                snapshot = self._session.snapshot()
+                now = utc_now()
+                fresh = self._required_registers_are_fresh(required, snapshot, now)
+                if not fresh:
+                    self._profile_explicit_requests += 1
+                    self._last_profile_request_block = block
+                    request_started_at = utc_now().isoformat()
+                    try:
+                        await self._session.async_read_input(block.start, block.count)
+                        requested.append(block)
+                    except asyncio.CancelledError:
+                        self._health = AcquisitionHealth.DEGRADED
+                        if active_recovery is not None:
+                            self._terminate_recovery(
+                                active_recovery, "reacquisition_cancelled"
+                            )
+                            active_recovery = None
+                        raise
+                    except LuxPowerReadRejectedError:
+                        self._health = AcquisitionHealth.DEGRADED
+                        if active_recovery is not None:
+                            self._terminate_recovery(
+                                active_recovery, "reacquisition_rejected"
+                            )
+                            active_recovery = None
+                        raise
+                    except LuxPowerCommunicationError as exc:
+                        if self._recovery_policy is None:
+                            self._health = AcquisitionHealth.DEGRADED
+                            raise
+                        failure_kind = self._classify_recovery_failure(exc)
+                        self._count_recovery_failure(failure_kind)
+                        if (
+                            active_recovery is not None
+                            and self._shutdown.is_set()
+                            and failure_kind is RecoveryFailureKind.SESSION_CLOSED
+                        ):
+                            self._health = AcquisitionHealth.DEGRADED
+                            self._terminate_recovery(
+                                active_recovery, "reacquisition_shutdown"
+                            )
+                            active_recovery = None
+                            raise
+                        if reconnects >= self._recovery_policy.max_reconnects_per_acquisition:
+                            if active_recovery is not None:
+                                self._terminate_recovery(
+                                    active_recovery, "reacquisition_failed"
+                                )
+                                active_recovery = None
+                            self._abandon_recovery(exc)
+                        reconnects += 1
+                        active_recovery = await self._recover_transport(
+                            exc, block, failure_kind, request_started_at
                         )
-                    )
-                    displaced_by_unsolicited = bool(due_indexes) and all(
-                        (accounted is None or signature[index] > accounted[index])
-                        and snapshot.input_sources.get(register)
-                        is LuxObservationSource.UNSOLICITED
-                        for index, register in enumerate(sorted(required))
-                        if index in due_indexes
-                    )
-                    if displaced_by_unsolicited:
-                        self._profile_unsolicited_avoided += 1
-                        unsolicited.append(block)
-                    self._profile_accounted_observations[block] = signature
-                elif accounted is None and signature is not None:
-                    self._profile_accounted_observations[block] = signature
-                continue
-            self._profile_explicit_requests += 1
-            self._last_profile_request_block = block
-            await self._session.async_read_input(block.start, block.count)
-            requested.append(block)
-            refreshed = self._session.snapshot().observed_at.input_registers
-            if all(register in refreshed for register in required):
-                self._profile_accounted_observations[block] = tuple(
-                    refreshed[register] for register in sorted(required)
+                        # A timeout in a later block can make an earlier block
+                        # stale. Restart selection; freshness will skip anything
+                        # still healthy and request only what recovery requires.
+                        restart_selection = True
+                        break
+
+                snapshot = self._session.snapshot()
+                now = utc_now()
+                observations = snapshot.observed_at.input_registers
+                signature = (
+                    tuple(observations[register] for register in sorted(required))
+                    if all(register in observations for register in required)
+                    else None
                 )
+                accounted = self._profile_accounted_observations.get(block)
+                if accounted is None and all(
+                    register in snapshot.explicit_observed_at for register in required
+                ):
+                    accounted = tuple(
+                        snapshot.explicit_observed_at[register]
+                        for register in sorted(required)
+                    )
+                    self._profile_accounted_observations[block] = accounted
+                opportunity_due = bool(
+                    accounted is None
+                    or now - min(accounted) >= self._freshness_target
+                )
+                if fresh:
+                    skipped.append(block)
+                    if opportunity_due and signature is not None and signature != accounted:
+                        due_indexes = (
+                            tuple(range(len(signature)))
+                            if accounted is None
+                            else tuple(
+                                index
+                                for index, observed in enumerate(accounted)
+                                if now - observed >= self._freshness_target
+                            )
+                        )
+                        displaced_by_unsolicited = bool(due_indexes) and all(
+                            (accounted is None or signature[index] > accounted[index])
+                            and snapshot.input_sources.get(register)
+                            is LuxObservationSource.UNSOLICITED
+                            for index, register in enumerate(sorted(required))
+                            if index in due_indexes
+                        )
+                        if displaced_by_unsolicited:
+                            self._profile_unsolicited_avoided += 1
+                            unsolicited.append(block)
+                        self._profile_accounted_observations[block] = signature
+                    elif accounted is None and signature is not None:
+                        self._profile_accounted_observations[block] = signature
+                    continue
+                refreshed = self._session.snapshot().observed_at.input_registers
+                if all(register in refreshed for register in required):
+                    self._profile_accounted_observations[block] = tuple(
+                        refreshed[register] for register in sorted(required)
+                    )
+        self._health = (
+            AcquisitionHealth.HEALTHY
+            if self._profile_is_fresh()
+            else AcquisitionHealth.DEGRADED
+        )
+        if active_recovery is not None and self._health is AcquisitionHealth.HEALTHY:
+            self._finish_recovery(active_recovery)
+        elif active_recovery is not None:
+            self._record_recovery(
+                active_recovery,
+                reconnect_succeeded=True,
+                outcome="profile_remained_stale",
+            )
+            self._active_recovery = None
         return HybridProfileRefreshResult(
             requested_blocks=tuple(requested),
             fresh_blocks_skipped=tuple(skipped),
             blocks_satisfied_unsolicited=tuple(unsolicited),
-            duration_ms=(time.monotonic() - started) * 1000,
+            duration_ms=(self._monotonic() - started) * 1000,
         )
+
+    async def _recover_transport(
+        self,
+        error: LuxPowerCommunicationError,
+        block: InputReadBlock,
+        kind: RecoveryFailureKind,
+        episode_started_at: str,
+    ) -> _ActiveRecovery:
+        """Perform one budgeted clean reconnect; never retry the request here."""
+        policy = self._recovery_policy
+        if policy is None:
+            raise error
+        now = self._monotonic()
+        cutoff = now - policy.rolling_window_seconds
+        while self._reconnect_attempt_times and self._reconnect_attempt_times[0] < cutoff:
+            self._reconnect_attempt_times.popleft()
+        if len(self._reconnect_attempt_times) >= policy.max_reconnects_per_window:
+            exhausted = _ActiveRecovery(
+                failure_kind=kind,
+                block=block,
+                started_monotonic=now,
+                episode_started_at=episode_started_at,
+                cooldown_seconds=0,
+                maximum_profile_age_seconds=self._maximum_profile_age_seconds(),
+            )
+            self._record_recovery(
+                exhausted,
+                reconnect_succeeded=False,
+                outcome="rolling_budget_exhausted",
+            )
+            self._abandon_recovery(error)
+
+        cooldown = (
+            policy.initial_cooldown_seconds
+            if not self._reconnect_attempt_times
+            else policy.repeated_cooldown_seconds
+        )
+        active = _ActiveRecovery(
+            failure_kind=kind,
+            block=block,
+            started_monotonic=now,
+            episode_started_at=episode_started_at,
+            cooldown_seconds=cooldown,
+            maximum_profile_age_seconds=self._maximum_profile_age_seconds(),
+        )
+        self._health = AcquisitionHealth.RECOVERING
+        self._active_recovery = active
+        self._reconnect_attempt_times.append(now)
+        self._reconnect_attempts += 1
+
+        try:
+            stopped = await self._shutdown_during(cooldown)
+        except asyncio.CancelledError:
+            self._health = AcquisitionHealth.DEGRADED
+            self._record_recovery(
+                active,
+                reconnect_succeeded=False,
+                outcome="cancelled",
+            )
+            self._active_recovery = None
+            raise
+        if stopped:
+            self._record_recovery(
+                active,
+                reconnect_succeeded=False,
+                outcome="shutdown",
+            )
+            self._active_recovery = None
+            raise LuxPowerSessionClosedError("recovery stopped by session shutdown")
+        try:
+            await self._session.async_connect()
+        except asyncio.CancelledError:
+            self._health = AcquisitionHealth.DEGRADED
+            self._record_recovery(
+                active,
+                reconnect_succeeded=False,
+                outcome="cancelled",
+            )
+            self._active_recovery = None
+            raise
+        except LuxPowerConnectionError:
+            self._connection_establishment_failure_count += 1
+            self._failed_reconnects += 1
+            self._health = AcquisitionHealth.DEGRADED
+            self._record_recovery(
+                active,
+                reconnect_succeeded=False,
+                outcome="connection_failed",
+            )
+            self._active_recovery = None
+            raise
+        if self._shutdown.is_set():
+            await self._session.async_close()
+            self._record_recovery(
+                active,
+                reconnect_succeeded=False,
+                outcome="shutdown",
+            )
+            self._active_recovery = None
+            raise LuxPowerSessionClosedError("recovery stopped by session shutdown")
+        self._successful_reconnects += 1
+        active.failure_to_connection_seconds = self._monotonic() - now
+        active.maximum_profile_age_seconds = self._max_optional(
+            active.maximum_profile_age_seconds,
+            self._maximum_profile_age_seconds(),
+        )
+        return active
+
+    async def _shutdown_during(self, delay: float) -> bool:
+        if self._shutdown.is_set():
+            return True
+        if delay == 0:
+            return self._shutdown.is_set()
+        try:
+            await asyncio.wait_for(self._shutdown.wait(), timeout=delay)
+        except asyncio.TimeoutError:
+            return self._shutdown.is_set()
+        return True
+
+    def _finish_recovery(self, active: _ActiveRecovery) -> None:
+        self._completed_recoveries += 1
+        self._record_recovery(
+            active,
+            reconnect_succeeded=True,
+            outcome="profile_recovered",
+            recovered=True,
+        )
+        self._active_recovery = None
+
+    def _terminate_recovery(self, active: _ActiveRecovery, outcome: str) -> None:
+        """Record one terminal non-success outcome and detach its sampler."""
+        self._record_recovery(
+            active,
+            reconnect_succeeded=active.failure_to_connection_seconds is not None,
+            outcome=outcome,
+        )
+        self._active_recovery = None
+
+    def _record_recovery(
+        self,
+        active: _ActiveRecovery,
+        *,
+        reconnect_succeeded: bool,
+        outcome: str,
+        recovered: bool = False,
+    ) -> None:
+        current_age = self._maximum_profile_age_seconds()
+        maximum_age = self._max_optional(
+            active.maximum_profile_age_seconds,
+            current_age,
+        )
+        self._recovery_events.append(
+            RecoveryEvent(
+                failure_kind=active.failure_kind,
+                episode_started_at=active.episode_started_at,
+                ended_at=utc_now().isoformat(),
+                failed_register_start=active.block.start,
+                failed_register_count=active.block.count,
+                cooldown_seconds=active.cooldown_seconds,
+                reconnect_succeeded=reconnect_succeeded,
+                failure_to_connection_seconds=(
+                    round(active.failure_to_connection_seconds, 6)
+                    if active.failure_to_connection_seconds is not None
+                    else None
+                ),
+                failure_to_profile_recovery_seconds=(
+                    round(self._monotonic() - active.started_monotonic, 6)
+                    if recovered
+                    else None
+                ),
+                maximum_profile_age_seconds=(
+                    round(maximum_age, 6) if maximum_age is not None else None
+                ),
+                outcome=outcome,
+            )
+        )
+
+    def _abandon_recovery(self, error: LuxPowerCommunicationError) -> None:
+        self._health = AcquisitionHealth.DEGRADED
+        self._retry_budget_exhausted += 1
+        self._acquisitions_abandoned += 1
+        raise LuxPowerRecoveryExhaustedError(
+            "bounded read-session recovery budget exhausted"
+        ) from error
+
+    @staticmethod
+    def _classify_recovery_failure(
+        error: LuxPowerCommunicationError,
+    ) -> RecoveryFailureKind:
+        if isinstance(error, LuxPowerReadTimeoutError):
+            return RecoveryFailureKind.REQUEST_TIMEOUT
+        if isinstance(error, LuxPowerConnectionLostError):
+            return RecoveryFailureKind.CONNECTION_LOST
+        if isinstance(error, LuxPowerConnectionError):
+            return RecoveryFailureKind.CONNECTION_ESTABLISHMENT
+        if isinstance(error, LuxPowerAmbiguousRequestError):
+            return RecoveryFailureKind.AMBIGUOUS_REQUEST
+        if isinstance(error, LuxPowerSessionClosedError):
+            return RecoveryFailureKind.SESSION_CLOSED
+        raise error
+
+    def _count_recovery_failure(self, kind: RecoveryFailureKind) -> None:
+        if kind is RecoveryFailureKind.REQUEST_TIMEOUT:
+            self._timeout_count += 1
+        elif kind is RecoveryFailureKind.CONNECTION_LOST:
+            self._connection_loss_count += 1
+        elif kind is RecoveryFailureKind.CONNECTION_ESTABLISHMENT:
+            self._connection_establishment_failure_count += 1
+        elif kind is RecoveryFailureKind.AMBIGUOUS_REQUEST:
+            self._ambiguous_request_count += 1
+
+    def _maximum_profile_age_seconds(self) -> float | None:
+        if self._profile is None:
+            return None
+        observations = self._session.snapshot().observed_at.input_registers
+        now = utc_now()
+        ages = [
+            (now - observations[register]).total_seconds()
+            for register in self._profile.required_registers
+            if register in observations
+        ]
+        return max(ages) if ages else None
+
+    def _profile_is_fresh(self) -> bool:
+        if self._profile is None:
+            return True
+        snapshot = self._session.snapshot()
+        now = utc_now()
+        return all(
+            self._required_registers_are_fresh(
+                self._profile.required_registers_in(block), snapshot, now
+            )
+            for block in self._profile.read_blocks
+        )
+
+    def _observe_recovery_age(self) -> None:
+        active = self._active_recovery
+        if active is not None:
+            active.maximum_profile_age_seconds = self._max_optional(
+                active.maximum_profile_age_seconds,
+                self._maximum_profile_age_seconds(),
+            )
+
+    @staticmethod
+    def _max_optional(first: float | None, second: float | None) -> float | None:
+        values = tuple(value for value in (first, second) if value is not None)
+        return max(values) if values else None
 
     async def async_read_profile(self) -> HybridProfileRefreshResult:
         """Force one profile read for timing; excluded from avoidance metrics."""
@@ -295,6 +711,11 @@ class LuxPowerHybridReadClient:
         for block in self._profile.read_blocks:
             self._last_profile_request_block = block
             await self._session.async_read_input(block.start, block.count)
+        self._health = (
+            AcquisitionHealth.HEALTHY
+            if self._profile_is_fresh()
+            else AcquisitionHealth.DEGRADED
+        )
         return HybridProfileRefreshResult(
             requested_blocks=self._profile.read_blocks,
             fresh_blocks_skipped=(),
@@ -395,10 +816,12 @@ class LuxPowerHybridReadClient:
         acquisition_done = asyncio.Event()
 
         def sample_freshness() -> None:
+            self._observe_recovery_age()
             now = utc_now()
             samples.append(
                 {
                     "at": now.isoformat(),
+                    "acquisition_health": self._health.value,
                     "profile_freshness": self._profile_freshness_summary(
                         self._session.snapshot(), now
                     ),
@@ -521,6 +944,10 @@ def _metrics_delta(
         "operational_registers_expected",
         "operational_registers_unmatched",
         "observation_queue_drops",
+        "connection_attempts",
+        "connection_failures",
+        "ambiguous_requests",
+        "modbus_rejections",
     )
     delta = {name: getattr(after, name) - getattr(before, name) for name in fields}
     new_latency_count = (

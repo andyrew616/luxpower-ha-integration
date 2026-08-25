@@ -69,6 +69,22 @@ receive avoidance credit.
 The existing complete 0–749 scan, semantic groups, Home Assistant polling, and
 write path are unchanged. The profile is additive experimental functionality.
 
+## Experimental bounded recovery
+
+`LuxPowerHybridReadClient` can be given a `RecoveryPolicy`. Recovery is opt-in
+and applies only to the standalone experimental profile acquisition path. A
+request timeout, connection loss, or ambiguous request taints and closes the
+current frame-aware connection before a clean generation is opened. Cached
+values and their original `observed_at` timestamps are retained throughout.
+
+The conservative default policy permits one reconnect within one acquisition
+and two reconnects in a rolling five-minute window. The first reconnect waits
+one second; another recovery in the same window waits five seconds. Exhaustion
+is explicit through `LuxPowerRecoveryExhaustedError` and `degraded` acquisition
+health. Explicit Modbus rejection, cancellation, and shutdown are never blindly
+retried. After reconnect, freshness is evaluated again and only stale required
+profile blocks are requested; recovery never triggers a full input scan.
+
 ## Read-only hardware validation status
 
 The corrected 12K single-phase two-block plan completed five forced refreshes

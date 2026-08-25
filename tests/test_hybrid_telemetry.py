@@ -27,6 +27,14 @@ from custom_components.lxp_modbus.read_profiles import (
     LoadLayout,
 )
 from custom_components.lxp_modbus.exceptions import LuxPowerReadTimeoutError
+from custom_components.lxp_modbus.exceptions import (
+    LuxPowerConnectionError,
+    LuxPowerConnectionLostError,
+    LuxPowerReadRejectedError,
+    LuxPowerRecoveryExhaustedError,
+    LuxPowerSessionClosedError,
+)
+from custom_components.lxp_modbus.recovery import AcquisitionHealth, RecoveryPolicy
 from luxpower.hybrid import (
     FULL_INPUT_READ_BLOCKS,
     OPERATIONAL_READ_BLOCKS,
@@ -412,6 +420,392 @@ def zero_metrics(**changes):
     )
     values.update(changes)
     return LuxReadSessionMetrics(**values)
+
+
+class RecoverySession(FakeSession):
+    """Small deterministic session double with no write surface."""
+
+    def __init__(self, profile, *, fresh_blocks=(), failures=(), connect_failures=()):
+        super().__init__()
+        self.profile = profile
+        self.failures = list(failures)
+        self.connect_failures = list(connect_failures)
+        self.connections = 1
+        self.connect_calls = 0
+        self.close_calls = 0
+        for block in fresh_blocks:
+            self._observe(block, LuxObservationSource.EXPLICIT)
+
+    def _observe(self, block, source):
+        now = utc_now()
+        for register in block.addresses():
+            self.values[register] = register
+            self.observed[register] = now
+            self.sources[register] = source
+            if source is LuxObservationSource.EXPLICIT:
+                self.explicit_observed[register] = now
+            else:
+                self.unsolicited_observed[register] = now
+
+    async def async_read_input(self, start, count):
+        self.reads.append((start, count))
+        if self.failures:
+            failure = self.failures.pop(0)
+            if failure is not None:
+                raise failure
+        self._observe(InputReadBlock(start, count), LuxObservationSource.EXPLICIT)
+
+    async def async_connect(self):
+        self.connect_calls += 1
+        if self.connect_failures:
+            failure = self.connect_failures.pop(0)
+            if failure is not None:
+                raise failure
+        self.connections += 1
+
+    async def async_close(self):
+        self.close_calls += 1
+
+    def metrics(self):
+        return zero_metrics(connections=self.connections)
+
+
+def recovery_policy(**changes):
+    values = dict(
+        max_reconnects_per_acquisition=1,
+        max_reconnects_per_window=2,
+        rolling_window_seconds=300,
+        initial_cooldown_seconds=0,
+        repeated_cooldown_seconds=0,
+    )
+    values.update(changes)
+    return RecoveryPolicy(**values)
+
+
+@pytest.mark.asyncio
+async def test_bounded_recovery_reacquires_only_stale_profile_block():
+    profile = standard_profile()
+    session = RecoverySession(
+        profile,
+        fresh_blocks=(profile.read_blocks[0],),
+        failures=(LuxPowerReadTimeoutError("synthetic"), None),
+    )
+    before = session.snapshot().observed_at.input_registers.copy()
+    client = LuxPowerHybridReadClient(
+        "192.0.2.1", "TESTDONGLE", "TESTINV001",
+        profile=profile, session=session, recovery_policy=recovery_policy(),
+    )
+    await client.async_connect()
+
+    result = await client.async_refresh_profile()
+
+    assert session.reads == [(160, 40), (160, 40)]
+    assert result.requested_blocks == (profile.read_blocks[1],)
+    assert all(
+        session.observed[register] == before[register]
+        for register in profile.required_registers_in(profile.read_blocks[0])
+    )
+    metrics = client.recovery_metrics()
+    assert metrics.health is AcquisitionHealth.HEALTHY
+    assert metrics.timeout_count == 1
+    assert metrics.successful_reconnects == 1
+    assert metrics.completed_recoveries == 1
+    assert metrics.events[0].outcome == "profile_recovered"
+
+
+@pytest.mark.asyncio
+async def test_repeated_failure_exhausts_per_acquisition_budget():
+    profile = standard_profile()
+    session = RecoverySession(
+        profile,
+        failures=(
+            LuxPowerReadTimeoutError("first"),
+            LuxPowerReadTimeoutError("second"),
+        ),
+    )
+    client = LuxPowerHybridReadClient(
+        "192.0.2.1", "TESTDONGLE", "TESTINV001",
+        profile=profile, session=session, recovery_policy=recovery_policy(),
+    )
+    await client.async_connect()
+
+    with pytest.raises(LuxPowerRecoveryExhaustedError):
+        await client.async_refresh_profile()
+
+    metrics = client.recovery_metrics()
+    assert metrics.reconnect_attempts == 1
+    assert metrics.timeout_count == 2
+    assert metrics.retry_budget_exhausted == 1
+    assert metrics.acquisitions_abandoned == 1
+    assert metrics.health is AcquisitionHealth.DEGRADED
+
+
+@pytest.mark.asyncio
+async def test_rolling_budget_prevents_reconnect_storm():
+    profile = standard_profile()
+    session = RecoverySession(
+        profile,
+        failures=(LuxPowerReadTimeoutError("first"), None),
+    )
+    client = LuxPowerHybridReadClient(
+        "192.0.2.1", "TESTDONGLE", "TESTINV001",
+        freshness_target=timedelta(microseconds=1),
+        profile=profile,
+        session=session,
+        recovery_policy=recovery_policy(max_reconnects_per_window=1),
+    )
+    await client.async_connect()
+    await client.async_refresh_profile()
+    await asyncio.sleep(0.002)
+    session.failures = [LuxPowerReadTimeoutError("again")]
+
+    with pytest.raises(LuxPowerRecoveryExhaustedError):
+        await client.async_refresh_profile()
+
+    assert session.connect_calls == 2  # initial client connect plus one recovery
+    assert client.recovery_metrics().reconnect_attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_shutdown_during_recovery_cooldown_never_reconnects():
+    profile = standard_profile()
+    session = RecoverySession(
+        profile, failures=(LuxPowerReadTimeoutError("synthetic"),)
+    )
+    client = LuxPowerHybridReadClient(
+        "192.0.2.1", "TESTDONGLE", "TESTINV001",
+        profile=profile,
+        session=session,
+        recovery_policy=recovery_policy(initial_cooldown_seconds=1),
+    )
+    await client.async_connect()
+    acquisition = asyncio.create_task(client.async_refresh_profile())
+    while client.acquisition_health is not AcquisitionHealth.RECOVERING:
+        await asyncio.sleep(0)
+    await client.async_close()
+
+    with pytest.raises(LuxPowerSessionClosedError):
+        await acquisition
+    assert session.connect_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_cancellation_during_recovery_never_reconnects():
+    profile = standard_profile()
+    session = RecoverySession(
+        profile, failures=(LuxPowerConnectionLostError("synthetic EOF"),)
+    )
+    client = LuxPowerHybridReadClient(
+        "192.0.2.1", "TESTDONGLE", "TESTINV001",
+        profile=profile,
+        session=session,
+        recovery_policy=recovery_policy(initial_cooldown_seconds=1),
+    )
+    await client.async_connect()
+    acquisition = asyncio.create_task(client.async_refresh_profile())
+    while client.acquisition_health is not AcquisitionHealth.RECOVERING:
+        await asyncio.sleep(0)
+    acquisition.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await acquisition
+    assert session.connect_calls == 1
+    assert client.recovery_metrics().events[0].outcome == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_cancellation_during_reacquisition_terminalizes_recovery():
+    profile = standard_profile()
+    session = RecoverySession(
+        profile,
+        failures=(LuxPowerReadTimeoutError("first"), asyncio.CancelledError()),
+    )
+    client = LuxPowerHybridReadClient(
+        "192.0.2.1", "TESTDONGLE", "TESTINV001",
+        profile=profile, session=session, recovery_policy=recovery_policy(),
+    )
+    await client.async_connect()
+
+    with pytest.raises(asyncio.CancelledError):
+        await client.async_refresh_profile()
+
+    metrics = client.recovery_metrics()
+    assert metrics.events[-1].outcome == "reacquisition_cancelled"
+    assert client._active_recovery is None
+
+
+@pytest.mark.asyncio
+async def test_modbus_rejection_during_reacquisition_terminalizes_without_retry():
+    profile = standard_profile()
+    session = RecoverySession(
+        profile,
+        failures=(
+            LuxPowerReadTimeoutError("first"),
+            LuxPowerReadRejectedError("exception 3"),
+        ),
+    )
+    client = LuxPowerHybridReadClient(
+        "192.0.2.1", "TESTDONGLE", "TESTINV001",
+        profile=profile, session=session, recovery_policy=recovery_policy(),
+    )
+    await client.async_connect()
+
+    with pytest.raises(LuxPowerReadRejectedError):
+        await client.async_refresh_profile()
+
+    metrics = client.recovery_metrics()
+    assert metrics.reconnect_attempts == 1
+    assert metrics.retry_budget_exhausted == 0
+    assert metrics.events[-1].outcome == "reacquisition_rejected"
+
+
+@pytest.mark.asyncio
+async def test_shutdown_during_reacquisition_is_not_budget_exhaustion():
+    profile = standard_profile()
+
+    class ShutdownDuringRetry(RecoverySession):
+        def __init__(self):
+            super().__init__(
+                profile, failures=(LuxPowerReadTimeoutError("first"),)
+            )
+            self.retry_started = asyncio.Event()
+            self.shutdown = asyncio.Event()
+
+        async def async_read_input(self, start, count):
+            if self.failures:
+                return await super().async_read_input(start, count)
+            self.reads.append((start, count))
+            self.retry_started.set()
+            await self.shutdown.wait()
+            raise LuxPowerSessionClosedError("closed by test")
+
+        async def async_close(self):
+            await super().async_close()
+            self.shutdown.set()
+
+    session = ShutdownDuringRetry()
+    client = LuxPowerHybridReadClient(
+        "192.0.2.1", "TESTDONGLE", "TESTINV001",
+        profile=profile, session=session, recovery_policy=recovery_policy(),
+    )
+    await client.async_connect()
+    acquisition = asyncio.create_task(client.async_refresh_profile())
+    await session.retry_started.wait()
+    await client.async_close()
+
+    with pytest.raises(LuxPowerSessionClosedError):
+        await acquisition
+    metrics = client.recovery_metrics()
+    assert metrics.retry_budget_exhausted == 0
+    assert metrics.events[-1].outcome == "reacquisition_shutdown"
+    assert client._active_recovery is None
+
+
+@pytest.mark.asyncio
+async def test_eof_and_unsolicited_recovery_are_source_aware():
+    profile = standard_profile()
+
+    class UnsolicitedOnConnect(RecoverySession):
+        async def async_connect(self):
+            await super().async_connect()
+            if self.connect_calls > 1:
+                self._observe(profile.read_blocks[0], LuxObservationSource.UNSOLICITED)
+
+    session = UnsolicitedOnConnect(
+        profile, failures=(LuxPowerConnectionLostError("synthetic EOF"), None)
+    )
+    client = LuxPowerHybridReadClient(
+        "192.0.2.1", "TESTDONGLE", "TESTINV001",
+        profile=profile, session=session, recovery_policy=recovery_policy(),
+    )
+    await client.async_connect()
+
+    await client.async_refresh_profile()
+
+    assert session.reads == [(0, 40), (160, 40)]
+    assert client.recovery_metrics().connection_loss_count == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_reconnect_and_modbus_rejection_are_not_blindly_retried():
+    profile = standard_profile()
+    failed_connect = RecoverySession(
+        profile,
+        failures=(LuxPowerReadTimeoutError("synthetic"),),
+        connect_failures=(None, LuxPowerConnectionError("offline")),
+    )
+    client = LuxPowerHybridReadClient(
+        "192.0.2.1", "TESTDONGLE", "TESTINV001",
+        profile=profile, session=failed_connect, recovery_policy=recovery_policy(),
+    )
+    await client.async_connect()
+    with pytest.raises(LuxPowerConnectionError):
+        await client.async_refresh_profile()
+    assert client.recovery_metrics().failed_reconnects == 1
+
+    rejected = RecoverySession(
+        profile, failures=(LuxPowerReadRejectedError("exception 3"),)
+    )
+    rejected_client = LuxPowerHybridReadClient(
+        "192.0.2.1", "TESTDONGLE", "TESTINV001",
+        profile=profile, session=rejected, recovery_policy=recovery_policy(),
+    )
+    await rejected_client.async_connect()
+    with pytest.raises(LuxPowerReadRejectedError):
+        await rejected_client.async_refresh_profile()
+    assert rejected_client.recovery_metrics().reconnect_attempts == 0
+
+
+@pytest.mark.asyncio
+async def test_repeated_recovery_uses_configured_cooldown_without_unbounded_retry():
+    profile = standard_profile()
+    session = RecoverySession(
+        profile,
+        failures=(LuxPowerReadTimeoutError("first"), None, None),
+    )
+    client = LuxPowerHybridReadClient(
+        "192.0.2.1", "TESTDONGLE", "TESTINV001",
+        freshness_target=timedelta(microseconds=1),
+        profile=profile,
+        session=session,
+        recovery_policy=recovery_policy(
+            initial_cooldown_seconds=0.001,
+            repeated_cooldown_seconds=0.003,
+        ),
+    )
+    await client.async_connect()
+    await client.async_refresh_profile()
+    await asyncio.sleep(0.002)
+    session.failures = [LuxPowerReadTimeoutError("second"), None, None]
+    await client.async_refresh_profile()
+
+    events = client.recovery_metrics().events
+    assert [event.cooldown_seconds for event in events] == [0.001, 0.003]
+    assert client.recovery_metrics().reconnect_attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_recovery_restarts_selection_and_reacquires_earlier_block_if_stale():
+    profile = standard_profile()
+    session = RecoverySession(
+        profile,
+        fresh_blocks=(profile.read_blocks[0],),
+        failures=(LuxPowerReadTimeoutError("later block"), None, None),
+    )
+    client = LuxPowerHybridReadClient(
+        "192.0.2.1", "TESTDONGLE", "TESTINV001",
+        freshness_target=timedelta(milliseconds=1),
+        profile=profile,
+        session=session,
+        recovery_policy=recovery_policy(initial_cooldown_seconds=0.003),
+    )
+    await client.async_connect()
+
+    await client.async_refresh_profile()
+
+    assert session.reads == [(160, 40), (0, 40), (160, 40)]
+    assert client.acquisition_health is AcquisitionHealth.HEALTHY
+    assert client.recovery_metrics().events[0].outcome == "profile_recovered"
 
 
 @pytest.mark.asyncio
