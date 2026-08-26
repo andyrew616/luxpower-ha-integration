@@ -955,10 +955,12 @@ class LuxPowerHybridReadClient:
 
         def sample_freshness() -> None:
             self._observe_recovery_age()
+            sampled_monotonic = time.monotonic()
             now = utc_now()
             samples.append(
                 {
                     "at": now.isoformat(),
+                    "monotonic_seconds": sampled_monotonic,
                     "acquisition_health": self._health.value,
                     "profile_freshness": self._profile_freshness_summary(
                         self._session.snapshot(), now

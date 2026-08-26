@@ -10,6 +10,7 @@ import json
 import math
 import os
 from pathlib import Path
+import random
 import re
 import statistics
 import subprocess
@@ -42,8 +43,11 @@ from luxpower.hybrid import (
     _metrics_delta,
 )
 
-PROFILE_VALIDATION_SCHEMA_VERSION = 7
-PROFILE_VALIDATION_VERSION = "7.0"
+PROFILE_VALIDATION_SCHEMA_VERSION = 8
+PROFILE_VALIDATION_VERSION = "8.0"
+PROFILE_FRESHNESS_QUANTILE_CAPACITY = 16_384
+PROFILE_VIOLATION_EPISODE_CAPACITY = 4_096
+PROFILE_FRESHNESS_RESERVOIR_SEED = 0
 
 
 def _maximum_age(freshness: Mapping[str, object]) -> float | None:
@@ -90,6 +94,415 @@ def summarize_profile_samples(samples: Sequence[Mapping[str, object]]) -> dict:
         "max_worst_age_seconds": round(max(ages), 3) if ages else None,
         "worst_register_sample_counts": outliers,
     }
+
+
+class _BoundedReservoir:
+    """Deterministic Algorithm-R reservoir for bounded distribution evidence."""
+
+    def __init__(self, capacity: int, *, seed: int) -> None:
+        if capacity <= 0:
+            raise ValueError("reservoir capacity must be positive")
+        self.capacity = capacity
+        self._random = random.Random(seed)
+        self._values: list[float] = []
+        self.seen = 0
+
+    def add(self, value: float) -> None:
+        self.seen += 1
+        if len(self._values) < self.capacity:
+            self._values.append(float(value))
+            return
+        replacement = self._random.randrange(self.seen)
+        if replacement < self.capacity:
+            self._values[replacement] = float(value)
+
+    @property
+    def values(self) -> tuple[float, ...]:
+        return tuple(self._values)
+
+    @property
+    def exact(self) -> bool:
+        return self.seen <= self.capacity
+
+
+class StreamingProfileFreshnessAggregator:
+    """Bounded append-only freshness evidence with exact threshold accounting.
+
+    Percentiles use a deterministic bounded reservoir once a phase exceeds the
+    configured capacity. Maximum age, sample/violation counts, sampled stale
+    duration, health duration, and retained violation episodes remain exact.
+    """
+
+    QUANTILE_METHOD = "deterministic_algorithm_r_reservoir_nearest_rank"
+
+    def __init__(
+        self,
+        target_seconds: float,
+        *,
+        quantile_capacity: int = PROFILE_FRESHNESS_QUANTILE_CAPACITY,
+        episode_capacity: int = PROFILE_VIOLATION_EPISODE_CAPACITY,
+        reservoir_seed: int = PROFILE_FRESHNESS_RESERVOIR_SEED,
+    ) -> None:
+        if target_seconds <= 0:
+            raise ValueError("freshness target must be positive")
+        if episode_capacity <= 0:
+            raise ValueError("episode capacity must be positive")
+        self.target_seconds = float(target_seconds)
+        self.quantile_capacity = quantile_capacity
+        self.episode_capacity = episode_capacity
+        self.reservoir_seed = reservoir_seed
+        self._ages = _BoundedReservoir(quantile_capacity, seed=reservoir_seed)
+        self._intervals = _BoundedReservoir(
+            quantile_capacity, seed=reservoir_seed + 1
+        )
+        self._samples = 0
+        self._complete_samples = 0
+        self._violations = 0
+        self._max_age: float | None = None
+        self._worst_register_counts: dict[str, int] = {}
+        self._health_seconds = {
+            "healthy": 0.0,
+            "recovering": 0.0,
+            "degraded": 0.0,
+        }
+        self._stale_seconds = 0.0
+        self._stale_by_health = {
+            "while_recovering": 0.0,
+            "outside_recovering": 0.0,
+        }
+        self._episodes: list[dict[str, object]] = []
+        self._episode_count = 0
+        self._episodes_dropped = 0
+        self._longest_episode_seconds = 0.0
+        self._maximum_interval_seconds: float | None = None
+        self._active_episode: dict[str, object] | None = None
+        self._last_sample: Mapping[str, object] | None = None
+        self._last_at: datetime | None = None
+        self._last_monotonic: float | None = None
+        self._utc_fallback_intervals = 0
+        self._clock_regressions = 0
+
+    @staticmethod
+    def _health(sample: Mapping[str, object]) -> str:
+        health = str(sample.get("acquisition_health", "degraded"))
+        return health if health in ("healthy", "recovering", "degraded") else "degraded"
+
+    def _is_stale(self, sample: Mapping[str, object]) -> bool:
+        freshness = sample["profile_freshness"]
+        age = _maximum_age(freshness)
+        return bool(
+            age is None
+            or freshness["known"] != freshness["required"]
+            or age > self.target_seconds
+        )
+
+    def _retain_episode(self, episode: Mapping[str, object]) -> None:
+        self._episode_count += 1
+        duration = float(episode["duration_seconds"])
+        self._longest_episode_seconds = max(
+            self._longest_episode_seconds, duration
+        )
+        if len(self._episodes) < self.episode_capacity:
+            self._episodes.append(dict(episode))
+        else:
+            self._episodes_dropped += 1
+
+    def _close_active_episode(self) -> None:
+        if self._active_episode is not None:
+            self._retain_episode(self._active_episode)
+            self._active_episode = None
+
+    def _integrate_interval(
+        self,
+        current: Mapping[str, object],
+        started: datetime,
+        ended: datetime,
+        duration: float,
+    ) -> None:
+        if duration < 0:
+            self._clock_regressions += 1
+            duration = 0.0
+        self._intervals.add(duration)
+        self._maximum_interval_seconds = (
+            duration
+            if self._maximum_interval_seconds is None
+            else max(self._maximum_interval_seconds, duration)
+        )
+        health = self._health(current)
+        self._health_seconds[health] += duration
+        if not self._is_stale(current):
+            self._close_active_episode()
+            return
+
+        self._stale_seconds += duration
+        bucket = (
+            "while_recovering" if health == "recovering" else "outside_recovering"
+        )
+        self._stale_by_health[bucket] += duration
+        freshness = current["profile_freshness"]
+        age = _maximum_age(freshness)
+        if self._active_episode is None:
+            self._active_episode = {
+                "started_at": started,
+                "ended_at": ended,
+                "duration_seconds": 0.0,
+                "maximum_age_seconds": float(age) if age is not None else None,
+            }
+        self._active_episode["ended_at"] = ended
+        self._active_episode["duration_seconds"] = (
+            float(self._active_episode["duration_seconds"]) + duration
+        )
+        if age is not None:
+            previous = self._active_episode["maximum_age_seconds"]
+            self._active_episode["maximum_age_seconds"] = max(
+                float(previous) if previous is not None else float(age),
+                float(age),
+            )
+
+    def append(self, sample: Mapping[str, object]) -> None:
+        """Consume the same append-only sample contract used by the live monitor."""
+        sampled_at = datetime.fromisoformat(str(sample["at"]))
+        sampled_monotonic = sample.get("monotonic_seconds")
+        monotonic_value = (
+            float(sampled_monotonic) if sampled_monotonic is not None else None
+        )
+        if self._last_sample is not None and self._last_at is not None:
+            if monotonic_value is not None and self._last_monotonic is not None:
+                duration = monotonic_value - self._last_monotonic
+            else:
+                duration = (sampled_at - self._last_at).total_seconds()
+                self._utc_fallback_intervals += 1
+            self._integrate_interval(
+                self._last_sample, self._last_at, sampled_at, duration
+            )
+
+        self._samples += 1
+        freshness = sample["profile_freshness"]
+        age = _maximum_age(freshness)
+        complete = bool(
+            freshness["known"] == freshness["required"] and age is not None
+        )
+        if complete:
+            self._complete_samples += 1
+            numeric_age = float(age)
+            self._ages.add(numeric_age)
+            self._max_age = (
+                numeric_age
+                if self._max_age is None
+                else max(self._max_age, numeric_age)
+            )
+            register = str(freshness["worst_register"])
+            self._worst_register_counts[register] = (
+                self._worst_register_counts.get(register, 0) + 1
+            )
+        if self._is_stale(sample):
+            self._violations += 1
+        self._last_sample = sample
+        self._last_at = sampled_at
+        self._last_monotonic = monotonic_value
+
+    @staticmethod
+    def _recovery_ranges(
+        recovery_events: Sequence[Mapping[str, object]],
+    ) -> tuple[tuple[datetime, datetime, str], ...]:
+        return tuple(
+            (
+                datetime.fromisoformat(str(event["episode_started_at"])),
+                datetime.fromisoformat(str(event["ended_at"])),
+                getattr(event["failure_kind"], "value", str(event["failure_kind"])),
+            )
+            for event in recovery_events
+        )
+
+    def _serialized_episodes(
+        self,
+        recovery_events: Sequence[Mapping[str, object]],
+    ) -> tuple[list[dict], bool, int, int]:
+        active = dict(self._active_episode) if self._active_episode is not None else None
+        episodes = [dict(episode) for episode in self._episodes]
+        effective_dropped = self._episodes_dropped
+        active_retained = False
+        final_stale = bool(
+            self._last_sample is not None and self._is_stale(self._last_sample)
+        )
+        if active is None and final_stale and self._last_at is not None:
+            freshness = self._last_sample["profile_freshness"]
+            age = _maximum_age(freshness)
+            active = {
+                "started_at": self._last_at,
+                "ended_at": self._last_at,
+                "duration_seconds": 0.0,
+                "maximum_age_seconds": float(age) if age is not None else None,
+            }
+        effective_episode_count = self._episode_count + int(active is not None)
+        if active is not None:
+            if len(episodes) < self.episode_capacity:
+                episodes.append(active)
+                active_retained = True
+            else:
+                effective_dropped += 1
+        recovery_ranges = self._recovery_ranges(recovery_events)
+        serialized = []
+        for index, episode in enumerate(episodes):
+            causes = sorted({
+                failure_kind
+                for recovery_start, recovery_end, failure_kind in recovery_ranges
+                if recovery_start <= episode["ended_at"]
+                and recovery_end >= episode["started_at"]
+            })
+            maximum_age = episode["maximum_age_seconds"]
+            serialized.append({
+                "started_at": episode["started_at"].isoformat(),
+                "ended_at": episode["ended_at"].isoformat(),
+                "duration_seconds": round(float(episode["duration_seconds"]), 3),
+                "maximum_age_seconds": (
+                    round(float(maximum_age), 3)
+                    if maximum_age is not None
+                    else None
+                ),
+                "cause": causes or ["undetermined_non_recovery"],
+                "right_censored": bool(
+                    final_stale
+                    and active_retained
+                    and index == len(episodes) - 1
+                ),
+            })
+        return (
+            serialized,
+            final_stale,
+            effective_dropped,
+            effective_episode_count,
+        )
+
+    def finalize(
+        self,
+        recovery_events: Sequence[Mapping[str, object]],
+    ) -> dict[str, object]:
+        """Return bounded phase evidence without retaining raw sample dictionaries."""
+        age_values = self._ages.values
+        (
+            episodes,
+            ended_stale,
+            effective_episodes_dropped,
+            episode_count,
+        ) = self._serialized_episodes(recovery_events)
+        recovery_ranges = self._recovery_ranges(recovery_events)
+        recovery_stale_seconds = 0.0
+        for episode in episodes:
+            episode_start = datetime.fromisoformat(episode["started_at"])
+            episode_end = datetime.fromisoformat(episode["ended_at"])
+            for recovery_start, recovery_end, _ in recovery_ranges:
+                overlap = (
+                    min(episode_end, recovery_end)
+                    - max(episode_start, recovery_start)
+                ).total_seconds()
+                recovery_stale_seconds += max(0.0, overlap)
+        recovery_stale_seconds = min(recovery_stale_seconds, self._stale_seconds)
+        interval_values = self._intervals.values
+        median_age = statistics.median(age_values) if age_values else None
+        p95_age = _nearest_rank_p95(age_values)
+        p99_age = (
+            _nearest_rank_p99(age_values)
+            if self._complete_samples >= 100 and len(age_values) >= 100
+            else None
+        )
+        retained_episode_count = len(episodes)
+        attribution_complete = effective_episodes_dropped == 0
+        return {
+            "freshness": {
+                "samples": self._samples,
+                "complete_samples": self._complete_samples,
+                "median_worst_age_seconds": (
+                    round(median_age, 3) if median_age is not None else None
+                ),
+                "p95_worst_age_seconds": (
+                    round(p95_age, 3) if p95_age is not None else None
+                ),
+                "p99_worst_age_seconds": (
+                    round(p99_age, 3) if p99_age is not None else None
+                ),
+                "max_worst_age_seconds": (
+                    round(self._max_age, 3) if self._max_age is not None else None
+                ),
+                "worst_register_sample_counts": dict(self._worst_register_counts),
+                "quantile_estimation": {
+                    "method": self.QUANTILE_METHOD,
+                    "capacity": self.quantile_capacity,
+                    "samples_seen": self._ages.seen,
+                    "samples_retained": len(age_values),
+                    "exact": self._ages.exact,
+                    "seed": self.reservoir_seed,
+                },
+            },
+            "stale_threshold_violations": self._violations,
+            "sampled_time_beyond_target_seconds": round(self._stale_seconds, 3),
+            "sampled_time_beyond_target_by_health_state_seconds": {
+                name: round(value, 3)
+                for name, value in self._stale_by_health.items()
+            },
+            "sampled_time_by_health_state_seconds": {
+                name: round(value, 3) for name, value in self._health_seconds.items()
+            },
+            "sampled_time_beyond_target_attribution_seconds": {
+                "recovery_episode": (
+                    round(recovery_stale_seconds, 3)
+                    if attribution_complete
+                    else None
+                ),
+                "normal_operation": (
+                    round(self._stale_seconds - recovery_stale_seconds, 3)
+                    if attribution_complete
+                    else None
+                ),
+                "method": "continuous_interval_overlap",
+                "complete": attribution_complete,
+            },
+            "violation_episodes": {
+                "count": episode_count,
+                "retained_count": retained_episode_count,
+                "episodes_dropped": effective_episodes_dropped,
+                "ended_stale": ended_stale,
+                "right_censored_episode_count": int(ended_stale),
+                "longest_duration_seconds": round(
+                    max(
+                        self._longest_episode_seconds,
+                        float(self._active_episode["duration_seconds"])
+                        if self._active_episode is not None
+                        else 0.0,
+                    ),
+                    3,
+                ),
+                "sampling_interval_seconds": {
+                    "median": (
+                        round(statistics.median(interval_values), 6)
+                        if interval_values
+                        else None
+                    ),
+                    "max": (
+                        round(self._maximum_interval_seconds, 6)
+                        if self._maximum_interval_seconds is not None
+                        else None
+                    ),
+                    "quantile_exact": self._intervals.exact,
+                },
+                "episodes": episodes,
+            },
+            "evidence_complete": bool(
+                effective_episodes_dropped == 0 and self._clock_regressions == 0
+            ),
+            "bounded_retention": {
+                "raw_samples_retained": 0,
+                "quantile_capacity": self.quantile_capacity,
+                "violation_episode_capacity": self.episode_capacity,
+                "duration_clock": (
+                    "monotonic"
+                    if self._utc_fallback_intervals == 0
+                    else "monotonic_with_utc_fallback"
+                ),
+                "utc_fallback_intervals": self._utc_fallback_intervals,
+                "clock_regressions": self._clock_regressions,
+            },
+        }
 
 
 def _time_beyond_target(
@@ -541,9 +954,9 @@ def aggregate_qualification_reports(
     """Aggregate sanitized sustained phases without inferring long-term rates."""
     phases: list[tuple[Mapping[str, object], Mapping[str, object]]] = []
     for report in reports:
-        if int(report.get("schema_version", 0)) not in (3, 4, 5, 6, 7):
+        if int(report.get("schema_version", 0)) not in (3, 4, 5, 6, 7, 8):
             raise ValueError(
-                "qualification aggregation requires schema-v3 through v7 reports"
+                "qualification aggregation requires schema-v3 through v8 reports"
             )
         phases.extend(
             (report, phase)
@@ -574,7 +987,7 @@ def aggregate_qualification_reports(
             "reply_timeout_seconds",
             "split_request_deadlines",
         ]
-        if report_schemas in ({6}, {7}):
+        if report_schemas in ({6}, {7}, {8}):
             provenance_keys.extend(
                 (
                     "tcp_keepalive_enabled",
@@ -593,6 +1006,30 @@ def aggregate_qualification_reports(
                     raise ValueError(
                         "schema-v6+ qualification is missing required provenance"
                     )
+        if report_schemas == {8}:
+            for report in provenance_reports:
+                provenance = report.get("provenance")
+                aggregation = (
+                    provenance.get("freshness_aggregation")
+                    if isinstance(provenance, Mapping)
+                    else None
+                )
+                required_aggregation_fields = {
+                    "mode",
+                    "quantile_method",
+                    "quantile_capacity",
+                    "violation_episode_capacity",
+                    "raw_samples_retained",
+                    "duration_clock",
+                }
+                if (
+                    not isinstance(provenance, Mapping)
+                    or not isinstance(aggregation, Mapping)
+                    or not required_aggregation_fields <= set(aggregation)
+                ):
+                    raise ValueError(
+                        "schema-v8 qualification is missing freshness aggregation provenance"
+                    )
         provenance_sets = {
             tuple(report["provenance"][key] for key in provenance_keys)
             for report in provenance_reports
@@ -610,10 +1047,20 @@ def aggregate_qualification_reports(
             for report in provenance_reports
             if int(report.get("schema_version", 0)) >= 7
         }
+        freshness_aggregation_signatures = {
+            json.dumps(
+                report.get("provenance", {}).get("freshness_aggregation"),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            for report in provenance_reports
+            if int(report.get("schema_version", 0)) >= 8
+        }
         if (
             len(provenance_sets) != 1
             or len(profile_signatures) != 1
             or len(recovery_signatures) > 1
+            or len(freshness_aggregation_signatures) > 1
         ):
             raise ValueError(
                 "qualification reports use different revisions, profiles, "
@@ -723,19 +1170,37 @@ def aggregate_qualification_reports(
         for state in ("healthy", "recovering", "degraded")
     }
     right_censored_episode_count = sum(
-        bool(episode.get("right_censored", False))
-        for _, phase in phases
-        for episode in phase["violation_episodes"].get("episodes", [])
-    )
-    runs_ending_stale = sum(
-        any(
+        int(phase["violation_episodes"].get("right_censored_episode_count", 0))
+        if int(report["schema_version"]) >= 8
+        else sum(
             bool(episode.get("right_censored", False))
             for episode in phase["violation_episodes"].get("episodes", [])
         )
+        for report, phase in phases
+    )
+    runs_ending_stale = sum(
+        bool(phase["violation_episodes"].get("ended_stale", False))
+        if int(report["schema_version"]) >= 8
+        else any(
+            bool(episode.get("right_censored", False))
+            for episode in phase["violation_episodes"].get("episodes", [])
+        )
+        for report, phase in phases
+    )
+    evidence_complete = all(
+        bool(phase.get("freshness_evidence_complete", False))
+        if int(report["schema_version"]) >= 8
+        else True
+        for report, phase in phases
+    )
+    episode_details_dropped = sum(
+        int(phase["violation_episodes"].get("episodes_dropped", 0))
         for _, phase in phases
     )
     return {
-        "schema_version": 3 if report_schemas == {7} else 2,
+        "schema_version": (
+            4 if report_schemas == {8} else 3 if report_schemas == {7} else 2
+        ),
         "source_report_schema_version": (
             next(iter({int(report["schema_version"]) for report, _ in phases}))
             if len({int(report["schema_version"]) for report, _ in phases}) == 1
@@ -771,7 +1236,7 @@ def aggregate_qualification_reports(
                     "provenance"
                 ].get("receive_inactivity_timeout_seconds"),
             }
-            if report_schemas in ({6}, {7})
+            if report_schemas in ({6}, {7}, {8})
             else None
         ),
         "sustained_runs": len(phases),
@@ -803,6 +1268,8 @@ def aggregate_qualification_reports(
         ),
         "freshness": {
             "strict_target_met": all(bool(phase["target_met"]) for _, phase in phases),
+            "evidence_complete": evidence_complete,
+            "episode_details_dropped": episode_details_dropped,
             "violating_samples": violations,
             "sampled_time_beyond_target_seconds": round(stale_duration, 3),
             "longest_violation_episode_seconds": round(longest, 3),
@@ -835,11 +1302,13 @@ async def _run_profile_phase(
     before_profile = client.profile_metrics()
     before_recovery = client.recovery_metrics()
     before_diagnostics = _client_diagnostics(client)
-    samples: list[dict] = []
+    freshness_evidence = StreamingProfileFreshnessAggregator(target_seconds)
     error = None
     started = time.monotonic()
     try:
-        await client.async_run_profile(duration_seconds, sample_sink=samples)
+        await client.async_run_profile(
+            duration_seconds, sample_sink=freshness_evidence
+        )
     except LuxPowerCommunicationError as exc:
         error = type(exc).__name__
     actual_duration = time.monotonic() - started
@@ -862,14 +1331,6 @@ async def _run_profile_phase(
         after_profile.explicit_requests_avoided_unsolicited
         - before_profile.explicit_requests_avoided_unsolicited
     )
-    freshness = summarize_profile_samples(samples)
-    violations = sum(
-        _maximum_age(item["profile_freshness"]) is None
-        or item["profile_freshness"]["known"]
-        != item["profile_freshness"]["required"]
-        or _maximum_age(item["profile_freshness"]) > target_seconds
-        for item in samples
-    )
     unsafe_events = sum(
         session_delta[field]
         for field in (
@@ -878,6 +1339,9 @@ async def _run_profile_phase(
         )
     )
     recovery_delta = _recovery_metrics_delta(before_recovery, after_recovery)
+    streamed = freshness_evidence.finalize(recovery_delta["events"])
+    freshness = streamed["freshness"]
+    violations = streamed["stale_threshold_violations"]
     recovery_safe = bool(
         not error
         and not unsafe_events
@@ -888,14 +1352,7 @@ async def _run_profile_phase(
             for event in recovery_delta["events"]
         )
     )
-    freshness_met = bool(samples and not violations)
-    stale_by_health = _time_beyond_target_by_health_state(samples, target_seconds)
-    stale_by_episode = _time_beyond_target_by_recovery_episode(
-        samples, target_seconds, recovery_delta["events"]
-    )
-    violation_episodes = _violation_episode_summary(
-        samples, target_seconds, recovery_delta["events"]
-    )
+    freshness_met = bool(freshness["samples"] and not violations)
     return {
         "name": name,
         "target_seconds": target_seconds,
@@ -925,16 +1382,26 @@ async def _run_profile_phase(
         },
         "freshness": freshness,
         "stale_threshold_violations": violations,
-        "sampled_time_beyond_target_seconds": round(
-            _time_beyond_target(samples, target_seconds), 3
-        ),
-        "sampled_time_beyond_target_by_health_state_seconds": stale_by_health,
-        "sampled_time_by_health_state_seconds": _time_by_health_state(samples),
-        "sampled_time_beyond_target_attribution_seconds": stale_by_episode,
-        "violation_episodes": violation_episodes,
+        "sampled_time_beyond_target_seconds": streamed[
+            "sampled_time_beyond_target_seconds"
+        ],
+        "sampled_time_beyond_target_by_health_state_seconds": streamed[
+            "sampled_time_beyond_target_by_health_state_seconds"
+        ],
+        "sampled_time_by_health_state_seconds": streamed[
+            "sampled_time_by_health_state_seconds"
+        ],
+        "sampled_time_beyond_target_attribution_seconds": streamed[
+            "sampled_time_beyond_target_attribution_seconds"
+        ],
+        "violation_episodes": streamed["violation_episodes"],
+        "freshness_evidence_complete": streamed["evidence_complete"],
+        "freshness_retention": streamed["bounded_retention"],
         "transport_recovery_safe": recovery_safe,
         "freshness_target_met": freshness_met,
-        "target_met": bool(recovery_safe and freshness_met),
+        "target_met": bool(
+            recovery_safe and freshness_met and streamed["evidence_complete"]
+        ),
         "request_diagnostics": _diagnostic_delta(
             before_diagnostics,
             after_diagnostics,
@@ -1006,6 +1473,18 @@ async def execute_profile_validation(
             "receive_inactivity_timeout_seconds": getattr(
                 client, "receive_inactivity_timeout_seconds", 900.0
             ),
+            "freshness_aggregation": {
+                "mode": "streaming_bounded",
+                "quantile_method": (
+                    StreamingProfileFreshnessAggregator.QUANTILE_METHOD
+                ),
+                "quantile_capacity": PROFILE_FRESHNESS_QUANTILE_CAPACITY,
+                "violation_episode_capacity": (
+                    PROFILE_VIOLATION_EPISODE_CAPACITY
+                ),
+                "raw_samples_retained": 0,
+                "duration_clock": "monotonic",
+            },
         },
         "started_at": utc_now().isoformat(),
         "safety": {

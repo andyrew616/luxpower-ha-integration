@@ -46,6 +46,7 @@ from luxpower.profile_validation import (
     _write_private_report,
     aggregate_qualification_reports,
     execute_profile_validation,
+    StreamingProfileFreshnessAggregator,
     summarize_profile_samples,
 )
 from luxpower.hybrid import _latency_summary
@@ -121,6 +122,255 @@ def test_time_beyond_target_uses_actual_sample_intervals():
         "recovery_episode": 0.125,
         "normal_operation": 0.0,
     }
+
+
+def test_streaming_freshness_matches_exact_helpers_before_capacity():
+    samples = [
+        {
+            "at": "2026-08-25T12:00:00+00:00",
+            "acquisition_health": "recovering",
+            "profile_freshness": {
+                "known": 1,
+                "required": 1,
+                "max_age_seconds": 5.1,
+                "max_age_seconds_raw": 5.100001,
+                "worst_register": 114,
+            },
+        },
+        {
+            "at": "2026-08-25T12:00:00.125000+00:00",
+            "acquisition_health": "healthy",
+            "profile_freshness": {
+                "known": 1,
+                "required": 1,
+                "max_age_seconds": 4.0,
+                "max_age_seconds_raw": 4.0,
+                "worst_register": 0,
+            },
+        },
+        {
+            "at": "2026-08-25T12:00:00.240000+00:00",
+            "acquisition_health": "healthy",
+            "profile_freshness": {
+                "known": 1,
+                "required": 1,
+                "max_age_seconds": 4.1,
+                "max_age_seconds_raw": 4.1,
+                "worst_register": 0,
+            },
+        },
+    ]
+    recovery_events = [{
+        "episode_started_at": "2026-08-25T11:59:59.900000+00:00",
+        "ended_at": "2026-08-25T12:00:00.200000+00:00",
+        "failure_kind": RecoveryFailureKind.REQUEST_TIMEOUT,
+    }]
+    accumulator = StreamingProfileFreshnessAggregator(5.0, quantile_capacity=8)
+    for sample in samples:
+        accumulator.append(sample)
+
+    result = accumulator.finalize(recovery_events)
+
+    assert "quantile_estimation" in result["freshness"]
+    assert {
+        key: value
+        for key, value in result["freshness"].items()
+        if key != "quantile_estimation"
+    } == summarize_profile_samples(samples)
+    assert result["freshness"]["quantile_estimation"]["exact"] is True
+    assert result["stale_threshold_violations"] == 1
+    assert result["sampled_time_beyond_target_seconds"] == 0.125
+    assert result["sampled_time_beyond_target_by_health_state_seconds"] == {
+        "while_recovering": 0.125,
+        "outside_recovering": 0.0,
+    }
+    assert result["sampled_time_by_health_state_seconds"] == {
+        "healthy": 0.115,
+        "recovering": 0.125,
+        "degraded": 0.0,
+    }
+    assert result["sampled_time_beyond_target_attribution_seconds"] == {
+        "recovery_episode": 0.125,
+        "normal_operation": 0.0,
+        "method": "continuous_interval_overlap",
+        "complete": True,
+    }
+    assert result["bounded_retention"]["raw_samples_retained"] == 0
+    assert result["evidence_complete"] is True
+
+
+def test_streaming_freshness_quantile_retention_is_bounded():
+    accumulator = StreamingProfileFreshnessAggregator(
+        2000.0, quantile_capacity=8, reservoir_seed=17
+    )
+    started = utc_now()
+    for index in range(1000):
+        accumulator.append({
+            "at": (started + timedelta(milliseconds=100 * index)).isoformat(),
+            "acquisition_health": "healthy",
+            "profile_freshness": {
+                "known": 1,
+                "required": 1,
+                "max_age_seconds": float(index),
+                "max_age_seconds_raw": float(index),
+                "worst_register": 114,
+            },
+        })
+
+    result = accumulator.finalize([])
+    quantiles = result["freshness"]["quantile_estimation"]
+
+    assert result["freshness"]["samples"] == 1000
+    assert result["freshness"]["max_worst_age_seconds"] == 999.0
+    assert quantiles["samples_seen"] == 1000
+    assert quantiles["samples_retained"] == 8
+    assert quantiles["exact"] is False
+    assert result["bounded_retention"]["raw_samples_retained"] == 0
+
+
+def test_streaming_freshness_reports_bounded_episode_truncation():
+    accumulator = StreamingProfileFreshnessAggregator(
+        5.0, quantile_capacity=8, episode_capacity=2
+    )
+    started = utc_now()
+    for index, age in enumerate((6.0, 1.0, 6.0, 1.0, 6.0, 1.0, 1.0)):
+        accumulator.append({
+            "at": (started + timedelta(seconds=index)).isoformat(),
+            "acquisition_health": "healthy",
+            "profile_freshness": {
+                "known": 1,
+                "required": 1,
+                "max_age_seconds": age,
+                "worst_register": 114,
+            },
+        })
+
+    result = accumulator.finalize([{
+        "episode_started_at": started.isoformat(),
+        "ended_at": (started + timedelta(seconds=7)).isoformat(),
+        "failure_kind": RecoveryFailureKind.REQUEST_TIMEOUT,
+    }])
+
+    assert result["violation_episodes"]["count"] == 3
+    assert result["violation_episodes"]["retained_count"] == 2
+    assert result["violation_episodes"]["episodes_dropped"] == 1
+    assert result["sampled_time_beyond_target_attribution_seconds"] == {
+        "recovery_episode": None,
+        "normal_operation": None,
+        "method": "continuous_interval_overlap",
+        "complete": False,
+    }
+    assert result["evidence_complete"] is False
+
+
+def test_streaming_terminal_stale_transition_is_right_censored():
+    accumulator = StreamingProfileFreshnessAggregator(5.0, quantile_capacity=8)
+    started = utc_now()
+    for index, age in enumerate((1.0, 6.0)):
+        accumulator.append({
+            "at": (started + timedelta(seconds=index)).isoformat(),
+            "monotonic_seconds": 10.0 + index,
+            "acquisition_health": "healthy",
+            "profile_freshness": {
+                "known": 1,
+                "required": 1,
+                "max_age_seconds": age,
+                "worst_register": 114,
+            },
+        })
+
+    result = accumulator.finalize([])
+    episodes = result["violation_episodes"]
+
+    assert result["stale_threshold_violations"] == 1
+    assert episodes["count"] == 1
+    assert episodes["ended_stale"] is True
+    assert episodes["right_censored_episode_count"] == 1
+    assert episodes["episodes"][0]["duration_seconds"] == 0.0
+    assert episodes["episodes"][0]["right_censored"] is True
+
+
+def test_streaming_single_stale_sample_is_right_censored_without_duration():
+    accumulator = StreamingProfileFreshnessAggregator(5.0, quantile_capacity=8)
+    accumulator.append({
+        "at": utc_now().isoformat(),
+        "monotonic_seconds": 10.0,
+        "acquisition_health": "degraded",
+        "profile_freshness": {
+            "known": 0,
+            "required": 1,
+            "max_age_seconds": None,
+            "worst_register": None,
+        },
+    })
+
+    result = accumulator.finalize([])
+    episodes = result["violation_episodes"]
+
+    assert result["stale_threshold_violations"] == 1
+    assert result["sampled_time_beyond_target_seconds"] == 0.0
+    assert episodes["count"] == 1
+    assert episodes["ended_stale"] is True
+    assert episodes["episodes"][0]["right_censored"] is True
+
+
+def test_streaming_dropped_terminal_episode_keeps_run_end_truthful():
+    accumulator = StreamingProfileFreshnessAggregator(
+        5.0, quantile_capacity=8, episode_capacity=1
+    )
+    started = utc_now()
+    for index, age in enumerate((6.0, 1.0, 6.0)):
+        accumulator.append({
+            "at": (started + timedelta(seconds=index)).isoformat(),
+            "monotonic_seconds": 10.0 + index,
+            "acquisition_health": "healthy",
+            "profile_freshness": {
+                "known": 1,
+                "required": 1,
+                "max_age_seconds": age,
+                "worst_register": 114,
+            },
+        })
+
+    result = accumulator.finalize([])
+    episodes = result["violation_episodes"]
+
+    assert episodes["count"] == 2
+    assert episodes["retained_count"] == 1
+    assert episodes["episodes_dropped"] == 1
+    assert episodes["ended_stale"] is True
+    assert episodes["right_censored_episode_count"] == 1
+    assert not any(episode["right_censored"] for episode in episodes["episodes"])
+    assert result["sampled_time_beyond_target_attribution_seconds"][
+        "complete"
+    ] is False
+    assert result["evidence_complete"] is False
+
+
+def test_streaming_freshness_durations_use_monotonic_not_wall_clock():
+    accumulator = StreamingProfileFreshnessAggregator(5.0, quantile_capacity=8)
+    for at, monotonic in (
+        ("2026-08-25T12:00:01+00:00", 10.0),
+        ("2026-08-25T12:00:00+00:00", 10.1),
+    ):
+        accumulator.append({
+            "at": at,
+            "monotonic_seconds": monotonic,
+            "acquisition_health": "healthy",
+            "profile_freshness": {
+                "known": 1,
+                "required": 1,
+                "max_age_seconds": 6.0,
+                "worst_register": 114,
+            },
+        })
+
+    result = accumulator.finalize([])
+
+    assert result["sampled_time_beyond_target_seconds"] == 0.1
+    assert result["bounded_retention"]["duration_clock"] == "monotonic"
+    assert result["bounded_retention"]["clock_regressions"] == 0
+    assert result["evidence_complete"] is True
 
 
 def test_strict_ten_second_episodes_include_recovery_and_boundary_maximum():
@@ -515,6 +765,96 @@ def test_schema_v7_aggregation_requires_matching_recovery_policy():
         aggregate_qualification_reports(reports)
 
 
+def test_schema_v8_aggregation_requires_matching_streaming_provenance():
+    report = _qualification_report(
+        timeout=0,
+        reconnect=0,
+        target_met=True,
+        maximum=8.0,
+        values=[700.0] * 100,
+    )
+    report["schema_version"] = 8
+    report["phases"][0]["session_metrics"].update(
+        {
+            "tcp_keepalive_applied_connections": 1,
+            "tcp_keepalive_idle_applied_connections": 1,
+            "tcp_keepalive_configuration_failures": 0,
+            "tcp_keepalive_configuration_unavailable": 0,
+            "receive_inactivity_timeouts": 0,
+        }
+    )
+    report["profile"] = {
+        "definition_version": 1,
+        "name": "energy_flow",
+        "required_registers": [0, 114],
+        "blocks": [{"start": 0, "count": 40}, {"start": 80, "count": 40}],
+    }
+    report["provenance"] = {
+        "implementation_revision": "a" * 40,
+        "profile_definition_version": 1,
+        "drain_timeout_seconds": 3,
+        "reply_timeout_seconds": 10,
+        "split_request_deadlines": True,
+        "tcp_keepalive_enabled": True,
+        "tcp_keepalive_idle_seconds": 60,
+        "receive_inactivity_timeout_seconds": 900.0,
+        "freshness_aggregation": {
+            "mode": "streaming_bounded",
+            "quantile_method": (
+                "deterministic_algorithm_r_reservoir_nearest_rank"
+            ),
+            "quantile_capacity": 16384,
+            "violation_episode_capacity": 4096,
+            "raw_samples_retained": 0,
+            "duration_clock": "monotonic",
+        },
+    }
+    report["recovery_policy"] = {
+        "max_reconnects_per_acquisition": 1,
+        "max_reconnects_per_window": 2,
+        "max_connection_attempts_per_reconnect": 3,
+        "rolling_window_seconds": 300.0,
+        "initial_cooldown_seconds": 1.0,
+        "repeated_cooldown_seconds": 5.0,
+    }
+    report["phases"][0]["freshness_evidence_complete"] = True
+    report["phases"][0]["violation_episodes"].update(
+        {"ended_stale": False, "right_censored_episode_count": 0}
+    )
+    reports = [report, copy.deepcopy(report)]
+
+    aggregate = aggregate_qualification_reports(reports)
+
+    assert aggregate["schema_version"] == 4
+    assert aggregate["source_report_schema_version"] == 8
+    assert aggregate["freshness"]["evidence_complete"] is True
+    assert aggregate["freshness"]["episode_details_dropped"] == 0
+
+    reports[1]["phases"][0]["violation_episodes"].update(
+        {
+            "ended_stale": True,
+            "right_censored_episode_count": 1,
+            "episodes": [],
+        }
+    )
+    aggregate = aggregate_qualification_reports(reports)
+    assert aggregate["freshness"]["right_censored_episode_count"] == 1
+    assert aggregate["freshness"]["runs_ending_stale"] == 1
+
+    reports[1]["provenance"]["freshness_aggregation"][
+        "quantile_capacity"
+    ] = 8192
+    with pytest.raises(ValueError, match="different revisions, profiles"):
+        aggregate_qualification_reports(reports)
+
+    reports[1]["provenance"]["freshness_aggregation"][
+        "quantile_capacity"
+    ] = 16384
+    del reports[1]["provenance"]["freshness_aggregation"]["duration_clock"]
+    with pytest.raises(ValueError, match="missing freshness aggregation"):
+        aggregate_qualification_reports(reports)
+
+
 def test_live_qualification_requires_both_phase_deadlines():
     _validate_deadline_options(None, None)
     _validate_deadline_options(3, 10)
@@ -688,8 +1028,8 @@ async def test_short_only_schema_v5_provenance_and_intentional_shutdown_health()
         implementation_revision="a" * 40,
     )
 
-    assert report["schema_version"] == 7
-    assert report["validation_version"] == "7.0"
+    assert report["schema_version"] == 8
+    assert report["validation_version"] == "8.0"
     assert report["provenance"] == {
         "implementation_revision": "a" * 40,
         "revision_source": "operator_supplied",
@@ -703,9 +1043,27 @@ async def test_short_only_schema_v5_provenance_and_intentional_shutdown_health()
         "tcp_keepalive_enabled": True,
         "tcp_keepalive_idle_seconds": 60,
         "receive_inactivity_timeout_seconds": 900.0,
+        "freshness_aggregation": {
+            "mode": "streaming_bounded",
+            "quantile_method": (
+                "deterministic_algorithm_r_reservoir_nearest_rank"
+            ),
+            "quantile_capacity": 16384,
+            "violation_episode_capacity": 4096,
+            "raw_samples_retained": 0,
+            "duration_clock": "monotonic",
+        },
     }
     assert [phase["name"] for phase in report["phases"]] == ["short_1"]
     assert report["phases"][0]["target_met"] is True
+    assert report["phases"][0]["freshness_retention"] == {
+        "raw_samples_retained": 0,
+        "quantile_capacity": 16384,
+        "violation_episode_capacity": 4096,
+        "duration_clock": "monotonic_with_utc_fallback",
+        "utc_fallback_intervals": 1,
+        "clock_regressions": 0,
+    }
     assert report["forced_profile_refresh"]["target_seconds"] == 10.0
     assert report["forced_profile_refresh"]["five_second_interval_consumed_percent"] is None
     assert report["forced_profile_refresh"]["request_diagnostics"]["available"] is False

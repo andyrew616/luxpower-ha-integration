@@ -125,6 +125,39 @@ No 2–4 hour run was attempted. After the target/routing issue is confirmed, th
 next evidence step is two independent one-hour runs on the reviewed hardening
 revision. Only if both are safe and useful should a longer bounded soak follow.
 
+## Bounded hours-scale freshness evidence
+
+Schema v8 replaces the qualification runner's phase-wide list of nominal 10 Hz
+sample dictionaries with an append-only streaming accumulator. Acquisition and
+sampling cadence are unchanged. Exact counters retain sample completeness,
+strict threshold violations, maximum age, real sampled stale duration, health
+duration, and bounded causal violation episodes. No raw freshness samples are
+written to the report.
+
+Median, p95, and p99 are exact while the phase has at most 16,384 complete
+samples. Longer phases use a deterministic 16,384-value Algorithm-R reservoir
+and label the resulting nearest-rank quantiles as estimates. The report records
+the method, capacity, samples seen and retained, seed, and whether a phase's
+quantiles remained exact. This makes memory independent of soak duration without
+presenting approximate percentiles as exact measurements.
+
+Sampled durations use run-local monotonic time. UTC timestamps remain for
+human-readable episode timestamps and continuous overlap with the recovery
+event timeline; they do not determine total stale or health duration. This
+prevents wall-clock/NTP adjustments from creating false stale or health totals,
+while leaving causal overlap subject to the recorded UTC event boundaries.
+
+Violation-episode evidence is capped at 4,096 episodes. The exact count, total
+sampled stale duration, and longest duration continue to advance after the cap,
+but a report explicitly becomes evidence-incomplete if episode details are
+truncated; such a phase cannot pass qualification. Causal recovery-versus-normal
+duration fields become unavailable rather than silently assigning dropped
+episodes to normal operation. An explicit `ended_stale` scalar preserves
+terminal right-censoring even when the detailed terminal episode cannot be
+retained. Recovery attribution in v8 uses continuous overlap between retained
+stale episodes and recorded recovery episodes, avoiding the previous one-sample
+boundary classification bias.
+
 ## Live artifacts
 
 Sanitized artifacts are stored outside the repository:
