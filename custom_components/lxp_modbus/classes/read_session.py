@@ -11,6 +11,7 @@ from enum import Enum
 import math
 import socket
 import time
+from types import MappingProxyType
 from typing import Awaitable, Callable, Mapping
 
 from ..const import MAX_PACKET_SIZE, READ_TIMEOUT
@@ -59,6 +60,8 @@ Connector = Callable[
     Awaitable[tuple[asyncio.StreamReader, asyncio.StreamWriter]],
 ]
 
+_OBSERVATION_SUBSCRIPTION_CLOSED = object()
+
 
 @dataclass(frozen=True)
 class LuxReadObservation:
@@ -70,10 +73,120 @@ class LuxReadObservation:
     observed_at: datetime
     explicit_response: bool
     duplicate: bool
+    sequence: int = 0
+
+    def __post_init__(self) -> None:
+        """Detach and freeze register values before sharing the observation."""
+        object.__setattr__(self, "values", MappingProxyType(dict(self.values)))
 
     @property
     def register_end(self) -> int:
         return self.register_start + self.register_count - 1
+
+
+@dataclass(frozen=True)
+class LuxObservationSubscriptionSnapshot:
+    """Detached delivery state for one opt-in observation subscriber."""
+
+    active: bool
+    queued: int
+    capacity: int
+    observations_received: int
+    observations_dropped: int
+    last_sequence_received: int | None
+
+
+@dataclass
+class _ObservationSubscriptionState:
+    queue: asyncio.Queue[object]
+    capacity: int
+    observations_received: int = 0
+    observations_dropped: int = 0
+    last_sequence_received: int | None = None
+    active: bool = True
+    consumer_waiting: bool = False
+
+
+class LuxObservationSubscription:
+    """One independent bounded stream of accepted FC4 observations.
+
+    Delivery is deliberately opt-in: sessions with no subscribers retain no
+    observation-event copies. A slow subscriber drops its own oldest queued
+    observation and exposes that gap explicitly without delaying the socket
+    reader or affecting authoritative register state.
+    """
+
+    def __init__(
+        self,
+        session: "LuxReadSession",
+        identifier: int,
+        state: _ObservationSubscriptionState,
+    ) -> None:
+        self._session = session
+        self._identifier = identifier
+        self._state = state
+
+    async def async_next(
+        self, *, timeout: float | None = None
+    ) -> LuxReadObservation:
+        """Return the next observation for this subscription's sole consumer."""
+        if timeout is not None and timeout <= 0:
+            raise ValueError("timeout must be positive")
+        if not self._state.active:
+            raise LuxPowerSessionClosedError("observation subscription is closed")
+        if self._state.consumer_waiting:
+            raise RuntimeError(
+                "only one async_next waiter is allowed per observation subscription"
+            )
+        self._state.consumer_waiting = True
+        try:
+            if timeout is None:
+                item = await self._state.queue.get()
+            else:
+                item = await asyncio.wait_for(
+                    self._state.queue.get(), timeout=timeout
+                )
+        finally:
+            self._state.consumer_waiting = False
+        if item is _OBSERVATION_SUBSCRIPTION_CLOSED:
+            raise LuxPowerSessionClosedError("observation subscription is closed")
+        return item  # type: ignore[return-value]
+
+    def drain(self) -> tuple[LuxReadObservation, ...]:
+        """Return and remove currently queued observations without socket I/O."""
+        observations: list[LuxReadObservation] = []
+        while True:
+            try:
+                item = self._state.queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return tuple(observations)
+            if item is _OBSERVATION_SUBSCRIPTION_CLOSED:
+                return tuple(observations)
+            observations.append(item)  # type: ignore[arg-type]
+
+    def snapshot(self) -> LuxObservationSubscriptionSnapshot:
+        """Return sanitized delivery and gap counters for this subscriber."""
+        return LuxObservationSubscriptionSnapshot(
+            active=self._state.active,
+            queued=self._state.queue.qsize(),
+            capacity=self._state.capacity,
+            observations_received=self._state.observations_received,
+            observations_dropped=self._state.observations_dropped,
+            last_sequence_received=self._state.last_sequence_received,
+        )
+
+    def close(self) -> None:
+        """Unsubscribe and wake a pending consumer without touching the socket."""
+        self._session._remove_observation_subscription(  # noqa: SLF001
+            self._identifier,
+            self._state,
+        )
+
+    async def __aenter__(self) -> "LuxObservationSubscription":
+        return self
+
+    async def __aexit__(self, *_exc_info: object) -> None:
+        self.close()
 
 
 class LuxObservationSource(str, Enum):
@@ -241,9 +354,14 @@ class LuxReadSession:
         self._connection_lost = False
         self._connection_opened_diagnostic_monotonic = self._diagnostics.now()
         self._requests_on_generation = 0
-        self._observations: asyncio.Queue[LuxReadObservation] = asyncio.Queue(
-            maxsize=1024
+        self._observation_subscriptions: dict[
+            int, _ObservationSubscriptionState
+        ] = {}
+        self._next_observation_subscription_id = 1
+        self._legacy_observation_subscription: LuxObservationSubscription | None = (
+            None
         )
+        self._observation_sequence = 0
 
         self._input_registers: dict[int, int] = {}
         self._input_observed_at: dict[int, datetime] = {}
@@ -643,19 +761,59 @@ class LuxReadSession:
     async def async_next_observation(
         self, *, timeout: float | None = None
     ) -> LuxReadObservation:
-        """Return the next accepted expected or unsolicited FC4 observation."""
-        if timeout is None:
-            return await self._observations.get()
-        return await asyncio.wait_for(self._observations.get(), timeout=timeout)
+        """Return the next observation from the lazily enabled legacy stream.
+
+        New consumers should call :meth:`subscribe_observations` before they
+        expect delivery. The legacy stream begins with the first call to this
+        method or :meth:`drain_observations`; observations received before then
+        are available in the authoritative snapshot but are not replayed.
+        """
+        return await self._legacy_subscription().async_next(timeout=timeout)
 
     def drain_observations(self) -> tuple[LuxReadObservation, ...]:
-        """Return and remove currently queued observations without socket access."""
-        observations: list[LuxReadObservation] = []
+        """Drain the lazily enabled legacy observation subscription."""
+        return self._legacy_subscription().drain()
+
+    def subscribe_observations(
+        self, *, max_queue_size: int = 1024
+    ) -> LuxObservationSubscription:
+        """Create an independent, bounded, single-consumer observation stream."""
+        if type(max_queue_size) is not int or max_queue_size <= 0:
+            raise ValueError("max_queue_size must be a positive integer")
+        identifier = self._next_observation_subscription_id
+        self._next_observation_subscription_id += 1
+        state = _ObservationSubscriptionState(
+            queue=asyncio.Queue(maxsize=max_queue_size),
+            capacity=max_queue_size,
+        )
+        self._observation_subscriptions[identifier] = state
+        return LuxObservationSubscription(self, identifier, state)
+
+    def _legacy_subscription(self) -> LuxObservationSubscription:
+        subscription = self._legacy_observation_subscription
+        if subscription is None or not subscription.snapshot().active:
+            subscription = self.subscribe_observations()
+            self._legacy_observation_subscription = subscription
+        return subscription
+
+    def _remove_observation_subscription(
+        self,
+        identifier: int,
+        state: _ObservationSubscriptionState,
+    ) -> None:
+        if not state.active:
+            return
+        if self._observation_subscriptions.get(identifier) is state:
+            del self._observation_subscriptions[identifier]
+        state.active = False
+        consumer_waiting = state.consumer_waiting
         while True:
             try:
-                observations.append(self._observations.get_nowait())
+                state.queue.get_nowait()
             except asyncio.QueueEmpty:
-                return tuple(observations)
+                break
+        if consumer_waiting:
+            state.queue.put_nowait(_OBSERVATION_SUBSCRIPTION_CLOSED)
 
     def snapshot(self) -> LuxReadSessionSnapshot:
         """Return detached values and per-register local observation times."""
@@ -968,6 +1126,7 @@ class LuxReadSession:
         if duplicate:
             self._duplicate_fc4_frames += 1
 
+        self._observation_sequence += 1
         observation = LuxReadObservation(
             register_start=response.register,
             register_count=count,
@@ -975,6 +1134,7 @@ class LuxReadSession:
             observed_at=observed_at,
             explicit_response=explicit,
             duplicate=duplicate,
+            sequence=self._observation_sequence,
         )
         self._publish_observation(observation)
 
@@ -1047,11 +1207,17 @@ class LuxReadSession:
         return LuxInvalidFrameReason.DATA_SANITY
 
     def _publish_observation(self, observation: LuxReadObservation) -> None:
-        if self._observations.full():
-            with suppress(asyncio.QueueEmpty):
-                self._observations.get_nowait()
-                self._observation_queue_drops += 1
-        self._observations.put_nowait(observation)
+        for state in tuple(self._observation_subscriptions.values()):
+            if not state.active:
+                continue
+            if state.queue.full():
+                with suppress(asyncio.QueueEmpty):
+                    state.queue.get_nowait()
+                    state.observations_dropped += 1
+                    self._observation_queue_drops += 1
+            state.queue.put_nowait(observation)
+            state.observations_received += 1
+            state.last_sequence_received = observation.sequence
 
     async def _reader_failed(self, generation: int, error: BaseException) -> None:
         async with self._lifecycle_lock:

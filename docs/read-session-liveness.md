@@ -37,10 +37,23 @@ the writer, fails pending work explicitly, resets the decoder, and prevents old
 traffic from entering a later connection generation. No heartbeat is emitted.
 
 Passive observation waits remain caller-bounded. A transport failure does not
-manufacture an observation to wake `async_next_observation(timeout=None)`;
+manufacture an observation to wake an active observation subscription;
 passive consumers that need liveness notification should use a finite wait and
-inspect session connectivity/metrics. This preserves the observation queue as
-a stream of genuine accepted observations only.
+inspect session connectivity/metrics.
+
+Observation event delivery is opt-in through `subscribe_observations()`. Each
+subscription is an independent, bounded, single-consumer queue. Slow consumers
+drop their own oldest event without delaying the socket reader or changing the
+authoritative register snapshot. Per-subscription counters and monotonically
+increasing observation sequence numbers expose delivery gaps. Delivered value
+mappings are immutable, and subscriptions persist across transport reconnects
+until explicitly closed (preferably with the async context manager).
+
+The legacy `async_next_observation()` and `drain_observations()` methods create
+one compatibility subscription lazily. They deliberately do not replay events
+accepted before their first call; those observations remain available from the
+authoritative session snapshot. With no active subscriber, the session retains
+no event copies and cannot report a consumer-delivery queue drop.
 
 ## Prior art
 

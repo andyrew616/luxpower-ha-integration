@@ -113,17 +113,129 @@ another qualification.
 The new multi-dial recovery behavior therefore remains synthetically validated
 but has not yet been naturally exercised against the live dongle.
 
+## Confirmed target and current hours-scale evidence
+
+The operator subsequently supplied the protocol-evidenced inverter target for
+the tested dongle. The live runner verified that target with exact FC4 replies
+for both profile blocks; it did not probe or switch to another target.
+
+Schema-v8 qualification used clean revision
+`67563526a59c30bd72c28d55852c302d303dcb46` with the same three-second drain,
+ten-second reply, keepalive, inactivity, profile, and multi-dial recovery
+configuration throughout its first four hours:
+
+| Run | Actual | Explicit / matched | Timeouts / reconnects | Median / p95 / p99 / max reply | Worst-age median / p95 / p99 / max | Time above 20 s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| A | 3600.001 s | 269 / 269 | 0 / 0 | 685 / 751 / 797 / 828 ms | 12.125 / 18.293 / 18.868 / 19.164 s | 0 s |
+| B | 3600.001 s | 280 / 278 | 2 / 2 | 687 / 756 / 969 / 1268 ms | 11.507 / 18.518 / 19.056 / 30.198 s | 20.492 s |
+| Long | 7200.002 s | 600 / 599 | 1 / 1 | 702 / 765 / 922 / 7332 ms | 11.761 / 18.557 / 19.020 / 30.169 s | 27.839 s |
+
+All three timeouts conservatively retired their connection generations and
+restored the complete profile on the first reconnect dial, in approximately
+1.8 seconds after failure detection. There was no invalid-frame acceptance,
+connection loss, Modbus rejection, retry-budget exhaustion, or false freshness.
+The long run also accepted four genuine replies between five and ten seconds,
+confirming that the independent ten-second correlated-reply window prevents
+unnecessary retirement without treating a genuine miss as success.
+
+The long run exposed 228 drops in an unconditional 1,024-event observation
+queue. Authoritative cache/freshness updates and pending-request completion
+happen before event publication, so those drops did not corrupt the measured
+telemetry; they did show that an unconsumed support stream was not a valid
+production boundary. Observation delivery was changed to opt-in, independent,
+bounded subscriptions with immutable payloads, sequence/gap counters, and
+explicit teardown. Subscriber delivery completeness is now reported separately
+from transport/recovery safety.
+
+The corrected revision
+`865c34e2dd6f93807fd35711d480d757d5694a5f` passed an exact two-block preflight,
+a 120.628-second smoke, and a further 7200.001-second soak:
+
+- 600/600 sustained explicit FC4 replies and 632 validated unmatched FC4;
+- one connection generation, no timeout, reconnect, connection loss, invalid
+  frame, Modbus rejection, queue drop, or inactivity retirement;
+- median/p95/p99/max accepted reply latency of
+  699.075/758.001/791.377/987.103 ms;
+- 71,363 complete freshness samples, with estimated median/p95/p99 ages of
+  11.932/18.510/18.968 seconds and an exact maximum of 19.861 seconds;
+- zero samples and zero sampled time above 20 seconds;
+- 7199.196 sampled seconds healthy, 0.804 seconds degraded during startup, and
+  no recovery interval;
+- 300 of 900 profile read opportunities (33.333%) satisfied by recent
+  validated unsolicited observations.
+
+The corrected soak processed 1,234 validated FC4 observations, exceeding the
+former 1,024-event boundary, while retaining no events and reporting no delivery
+drops because qualification has no event subscriber.
+
+## Current resource observations
+
+External sampling during the corrected two-hour soak consistently observed one
+thread and nine file descriptors. Post-interpreter RSS rose from about 30.1 MiB
+while the fixed 16,384-sample reservoir and bounded diagnostic histories filled,
+then changed gradually to about 32.7 MiB at the end. There was no queue-sized
+step, descriptor/thread accumulation, or sustained unbounded pattern. Decoder
+buffered bytes were zero at shutdown. Asyncio task/future counts were not
+sampled from the live process; deterministic shutdown, request, reconnect, and
+cancellation tests cover those ownership invariants.
+
 ## Decision
 
-Milestone B remains open. The normal persistent-session path completed one hour
-with stable socket ownership and useful 20-second-class telemetry, and one
-natural reconnect restored the profile correctly. However, the pre-fix terminal
-failed dial required hardening, and repeated post-fix wrong-target traffic
-prevented the necessary live proof.
+Milestone B is complete. Across six selected hours, the core issued 1,749
+sustained explicit requests and accepted 1,746. The three genuine misses were
+truthfully stale and safely recovered; the corrected final two-hour run was
+clean. Historical stale time above the 20-second target was 48.331 sampled
+seconds, approximately 0.224% of the six-hour observation window, and was never
+hidden by refreshed timestamps. This is evidence for useful, truthful
+20-second-class telemetry, not a promise that every future value will remain
+below exactly 20 seconds. The six hours span two reviewed revisions around the
+observation-delivery fix; they are supporting lifecycle evidence, not one
+homogeneous six-hour statistical trial.
 
-No 2–4 hour run was attempted. After the target/routing issue is confirmed, the
-next evidence step is two independent one-hour runs on the reviewed hardening
-revision. Only if both are safe and useful should a longer bounded soak follow.
+No further transport experiment is required before production-core
+consolidation. Application inactivity retirement and peer-loss keepalive remain
+synthetically rather than naturally exercised, but neither is a blocker to the
+observed safe lifecycle. The next work should classify and consolidate
+experimental tooling, freeze the supported standalone read/health API, and
+audit read-only BMS telemetry before assessing Smart Energy readiness.
+
+## Bounded hours-scale freshness evidence
+
+Schema v8 replaces the qualification runner's phase-wide list of nominal 10 Hz
+sample dictionaries with an append-only streaming accumulator. Acquisition and
+sampling cadence are unchanged. Exact counters retain sample completeness,
+strict threshold violations, maximum age, real sampled stale duration, health
+duration, and bounded causal violation episodes. No raw freshness samples are
+written to the report.
+
+Median, p95, and p99 are exact while the phase has at most 16,384 complete
+samples. Longer phases use a deterministic 16,384-value Algorithm-R reservoir
+and label the resulting nearest-rank quantiles as estimates. The report records
+the method, capacity, samples seen and retained, seed, and whether a phase's
+quantiles remained exact. This makes memory independent of soak duration without
+presenting approximate percentiles as exact measurements.
+
+Algorithm R follows Jeffrey Vitter's published reservoir-sampling method. The
+implementation was written independently; no external source code was copied.
+The standard-library `asyncio.Queue` nonblocking bounded-queue behavior is used
+for opt-in observation delivery.
+
+Sampled durations use run-local monotonic time. UTC timestamps remain for
+human-readable episode timestamps and continuous overlap with the recovery
+event timeline; they do not determine total stale or health duration. This
+prevents wall-clock/NTP adjustments from creating false stale or health totals,
+while leaving causal overlap subject to the recorded UTC event boundaries.
+
+Violation-episode evidence is capped at 4,096 episodes. The exact count, total
+sampled stale duration, and longest duration continue to advance after the cap,
+but a report explicitly becomes evidence-incomplete if episode details are
+truncated; such a phase cannot pass qualification. Causal recovery-versus-normal
+duration fields become unavailable rather than silently assigning dropped
+episodes to normal operation. An explicit `ended_stale` scalar preserves
+terminal right-censoring even when the detailed terminal episode cannot be
+retained. Recovery attribution in v8 uses continuous overlap between retained
+stale episodes and recorded recovery episodes, avoiding the previous one-sample
+boundary classification bias.
 
 ## Live artifacts
 
@@ -137,6 +249,14 @@ Sanitized artifacts are stored outside the repository:
 - `/tmp/luxpower-soak-recovery-a-resources.txt`
 - `/tmp/luxpower-soak-recovery-a-retry.json`
 - `/tmp/luxpower-soak-recovery-a-retry-resources.txt`
+- `/tmp/luxpower-milestone-b-run-a.json`
+- `/tmp/luxpower-milestone-b-run-b.json`
+- `/tmp/luxpower-milestone-b-long.json`
+- `/tmp/luxpower-milestone-b-ab-aggregate.json`
+- `/tmp/luxpower-milestone-b-preflight-reviewed.json`
+- `/tmp/luxpower-milestone-b-subscription-smoke.json`
+- `/tmp/luxpower-milestone-b-subscription-rerun.json`
+- `/tmp/luxpower-milestone-b-subscription-rerun.resources`
 
 These artifacts contain sanitized timings, ranges, classifications, and safe
 revision/configuration provenance only. They are not committed.

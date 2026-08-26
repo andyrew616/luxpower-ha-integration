@@ -13,6 +13,7 @@ from custom_components.lxp_modbus.classes.lxp_packet_utils import LxpPacketUtils
 from custom_components.lxp_modbus.classes.lxp_request_builder import LxpRequestBuilder
 from custom_components.lxp_modbus.classes.read_session import (
     LuxObservationSource,
+    LuxReadObservation,
     LuxReadSession,
 )
 from custom_components.lxp_modbus.exceptions import (
@@ -208,10 +209,11 @@ async def test_exact_response_and_unmatched_fc4_are_routed_independently():
     ])
     session = make_session(reader, writer, clock=lambda: next(times))
     await session.async_connect()
+    observations = session.subscribe_observations()
 
     result = await session.async_read_input(160, 40)
-    first = await session.async_next_observation(timeout=0.1)
-    second = await session.async_next_observation(timeout=0.1)
+    first = await observations.async_next(timeout=0.1)
+    second = await observations.async_next(timeout=0.1)
 
     assert result.register_start == 160
     assert result.explicit_response is True
@@ -352,17 +354,212 @@ async def test_duplicate_valid_reception_is_a_new_truthful_local_observation():
     ])
     session = make_session(reader, writer, clock=lambda: next(times))
     await session.async_connect()
+    observations = session.subscribe_observations()
     frame = input_response(0)
 
     reader.feed(frame)
-    first = await session.async_next_observation(timeout=0.1)
+    first = await observations.async_next(timeout=0.1)
     reader.feed(frame)
-    second = await session.async_next_observation(timeout=0.1)
+    second = await observations.async_next(timeout=0.1)
 
     assert first.duplicate is False
     assert second.duplicate is True
     assert second.observed_at > first.observed_at
     assert session.metrics().duplicate_fc4_frames == 1
+    await session.async_close()
+
+
+@pytest.mark.asyncio
+async def test_observation_delivery_is_opt_in_and_no_subscriber_cannot_drop():
+    reader = QueueReader()
+    writer = FakeWriter()
+    session = make_session(reader, writer)
+    observation = LuxReadObservation(
+        register_start=0,
+        register_count=1,
+        values={0: 7},
+        observed_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+        explicit_response=False,
+        duplicate=False,
+    )
+
+    for _ in range(1100):
+        session._publish_observation(observation)
+
+    assert session._observation_subscriptions == {}
+    assert session.metrics().observation_queue_drops == 0
+
+
+@pytest.mark.asyncio
+async def test_slow_subscriber_overflow_cannot_block_explicit_request_completion():
+    reader = QueueReader()
+    writer = FakeWriter(lambda _packet: reader.feed(input_response(80)))
+    session = make_session(reader, writer)
+    subscription = session.subscribe_observations(max_queue_size=1)
+    await session.async_connect()
+    reader.feed(input_response(0))
+    await asyncio.sleep(0.01)
+
+    result = await session.async_read_input(80, 40)
+
+    assert result.register_start == 80
+    with pytest.raises(TypeError):
+        result.values[80] = 99
+    assert session.snapshot().input_registers[80] == 0
+    assert [item.register_start for item in subscription.drain()] == [80]
+    assert subscription.snapshot().observations_dropped == 1
+    assert session.metrics().expected_fc4_responses == 1
+    await session.async_close()
+
+
+@pytest.mark.asyncio
+async def test_independent_observation_subscribers_report_only_their_own_gaps():
+    reader = QueueReader()
+    writer = FakeWriter()
+    session = make_session(reader, writer)
+    fast = session.subscribe_observations(max_queue_size=4)
+    slow = session.subscribe_observations(max_queue_size=1)
+    await session.async_connect()
+
+    reader.feed(input_response(0) + input_response(40))
+    await asyncio.sleep(0.01)
+
+    fast_items = fast.drain()
+    slow_items = slow.drain()
+    assert [item.register_start for item in fast_items] == [0, 40]
+    assert [item.sequence for item in fast_items] == [1, 2]
+    assert [item.register_start for item in slow_items] == [40]
+    assert [item.sequence for item in slow_items] == [2]
+    assert fast.snapshot().observations_dropped == 0
+    assert slow.snapshot().observations_dropped == 1
+    assert slow.snapshot().last_sequence_received == 2
+    assert session.metrics().observation_queue_drops == 1
+    await session.async_close()
+
+
+@pytest.mark.asyncio
+async def test_observation_values_are_immutable_across_subscribers():
+    reader = QueueReader()
+    writer = FakeWriter()
+    session = make_session(reader, writer)
+    first = session.subscribe_observations()
+    second = session.subscribe_observations()
+    await session.async_connect()
+    reader.feed(input_response(0))
+
+    first_item = await first.async_next(timeout=0.1)
+    second_item = await second.async_next(timeout=0.1)
+
+    with pytest.raises(TypeError):
+        first_item.values[0] = 99
+    assert second_item.values[0] == 0
+    await session.async_close()
+
+
+@pytest.mark.asyncio
+async def test_observation_subscription_allows_only_one_pending_consumer():
+    reader = QueueReader()
+    writer = FakeWriter()
+    session = make_session(reader, writer)
+    subscription = session.subscribe_observations()
+    first = asyncio.create_task(subscription.async_next())
+    await asyncio.sleep(0)
+
+    with pytest.raises(RuntimeError, match="only one async_next waiter"):
+        await subscription.async_next()
+
+    subscription.close()
+    with pytest.raises(LuxPowerSessionClosedError):
+        await first
+
+
+@pytest.mark.parametrize(
+    "capacity",
+    [True, 0, -1, 1.5, float("nan"), float("inf"), "2"],
+)
+def test_observation_subscription_requires_positive_integer_capacity(capacity):
+    session = make_session(QueueReader(), FakeWriter())
+
+    with pytest.raises(ValueError, match="positive integer"):
+        session.subscribe_observations(max_queue_size=capacity)
+
+
+@pytest.mark.asyncio
+async def test_observation_subscription_survives_reconnect_with_one_sequence():
+    readers = [QueueReader(), QueueReader()]
+    writers = [FakeWriter(), FakeWriter()]
+    connections = iter(zip(readers, writers))
+
+    async def connector(_host, _port):
+        return next(connections)
+
+    session = LuxReadSession(
+        "192.0.2.1", DONGLE.decode(), INVERTER.decode(), connector=connector
+    )
+    subscription = session.subscribe_observations()
+    await session.async_connect()
+    readers[0].feed(input_response(0))
+    first = await subscription.async_next(timeout=0.1)
+    await session.async_close()
+
+    await session.async_connect()
+    readers[1].feed(input_response(40))
+    second = await subscription.async_next(timeout=0.1)
+
+    assert (first.sequence, second.sequence) == (1, 2)
+    assert session.metrics().connections == 2
+    await session.async_close()
+
+
+@pytest.mark.asyncio
+async def test_subscription_context_manager_and_close_are_idempotent():
+    session = make_session(QueueReader(), FakeWriter())
+    subscription = session.subscribe_observations()
+
+    async with subscription:
+        assert subscription.snapshot().active is True
+
+    subscription.close()
+    assert subscription.snapshot().active is False
+    assert subscription.snapshot().queued == 0
+    assert session._observation_subscriptions == {}
+
+
+@pytest.mark.asyncio
+async def test_unsubscribe_wakes_pending_consumer_and_stops_delivery():
+    reader = QueueReader()
+    writer = FakeWriter()
+    session = make_session(reader, writer)
+    subscription = session.subscribe_observations(max_queue_size=2)
+    await session.async_connect()
+    pending = asyncio.create_task(subscription.async_next())
+    await asyncio.sleep(0)
+
+    subscription.close()
+
+    with pytest.raises(LuxPowerSessionClosedError):
+        await pending
+    assert subscription.snapshot().active is False
+    reader.feed(input_response(0))
+    await asyncio.sleep(0.01)
+    assert subscription.snapshot().observations_received == 0
+    assert session.metrics().observation_queue_drops == 0
+    await session.async_close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_observation_stream_is_lazy_and_remains_compatible():
+    reader = QueueReader()
+    writer = FakeWriter()
+    session = make_session(reader, writer)
+    await session.async_connect()
+    waiting = asyncio.create_task(session.async_next_observation(timeout=0.1))
+    await asyncio.sleep(0)
+
+    reader.feed(input_response(0))
+
+    assert (await waiting).register_start == 0
+    assert session.drain_observations() == ()
     await session.async_close()
 
 

@@ -17,6 +17,7 @@ import time
 from typing import Mapping, Sequence
 
 from custom_components.lxp_modbus.classes.read_session import (
+    LuxObservationSubscription,
     LuxObservationSource,
     LuxReadSession,
     LuxReadSessionMetrics,
@@ -340,6 +341,14 @@ class LuxPowerHybridReadClient:
     def drain_observations(self):
         """Return queued sanitized observation objects for measurement."""
         return self._session.drain_observations()
+
+    def subscribe_observations(
+        self, *, max_queue_size: int = 1024
+    ) -> LuxObservationSubscription:
+        """Create an independent bounded stream of accepted FC4 observations."""
+        return self._session.subscribe_observations(
+            max_queue_size=max_queue_size
+        )
 
     def set_freshness_target(self, target: timedelta) -> None:
         """Change only the experimental stale threshold between bounded phases."""
@@ -955,10 +964,12 @@ class LuxPowerHybridReadClient:
 
         def sample_freshness() -> None:
             self._observe_recovery_age()
+            sampled_monotonic = time.monotonic()
             now = utc_now()
             samples.append(
                 {
                     "at": now.isoformat(),
+                    "monotonic_seconds": sampled_monotonic,
                     "acquisition_health": self._health.value,
                     "profile_freshness": self._profile_freshness_summary(
                         self._session.snapshot(), now

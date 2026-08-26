@@ -347,6 +347,7 @@ async def test_profile_monitor_samples_through_final_in_flight_refresh():
     ).total_seconds()
 
     assert elapsed >= 0.025
+    assert samples[-1]["monotonic_seconds"] > samples[0]["monotonic_seconds"]
     assert samples[-1]["profile_freshness"]["known"] > 0
 
 
