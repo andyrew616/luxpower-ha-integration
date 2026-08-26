@@ -8,6 +8,8 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
+import math
+import socket
 import time
 from typing import Awaitable, Callable, Mapping
 
@@ -49,6 +51,8 @@ MAX_READ_REGISTERS = 125
 _READER_CHUNK_SIZE = MAX_PACKET_SIZE
 _PARTIAL_FRAME_TIMEOUT = READ_TIMEOUT
 _REQUEST_LATENCY_HISTORY = 4096
+_DEFAULT_TCP_KEEPALIVE_IDLE_SECONDS = 60
+_DEFAULT_RECEIVE_INACTIVITY_TIMEOUT = 900.0
 
 Connector = Callable[
     [str, int],
@@ -120,6 +124,11 @@ class LuxReadSessionMetrics:
     connection_failures: int = 0
     ambiguous_requests: int = 0
     modbus_rejections: int = 0
+    tcp_keepalive_applied_connections: int = 0
+    tcp_keepalive_idle_applied_connections: int = 0
+    tcp_keepalive_configuration_failures: int = 0
+    tcp_keepalive_configuration_unavailable: int = 0
+    receive_inactivity_timeouts: int = 0
 
 
 @dataclass
@@ -153,6 +162,11 @@ class LuxReadSession:
         request_timeout: float = READ_TIMEOUT,
         drain_timeout: float | None = None,
         reply_timeout: float | None = None,
+        tcp_keepalive: bool = True,
+        tcp_keepalive_idle_seconds: int = _DEFAULT_TCP_KEEPALIVE_IDLE_SECONDS,
+        receive_inactivity_timeout: float | None = (
+            _DEFAULT_RECEIVE_INACTIVITY_TIMEOUT
+        ),
         diagnostic_monotonic: Callable[[], float] = time.monotonic,
         diagnostic_event_capacity: int = 512,
         diagnostic_request_capacity: int = 4096,
@@ -172,6 +186,19 @@ class LuxReadSession:
             raise ValueError("drain_timeout must be positive")
         if reply_timeout is not None and reply_timeout <= 0:
             raise ValueError("reply_timeout must be positive")
+        if (
+            isinstance(tcp_keepalive_idle_seconds, bool)
+            or not isinstance(tcp_keepalive_idle_seconds, int)
+            or tcp_keepalive_idle_seconds <= 0
+        ):
+            raise ValueError("tcp_keepalive_idle_seconds must be positive")
+        if receive_inactivity_timeout is not None and (
+            receive_inactivity_timeout <= 0
+            or not math.isfinite(receive_inactivity_timeout)
+        ):
+            raise ValueError(
+                "receive_inactivity_timeout must be finite and positive"
+            )
 
         self._host = host
         self._port = port
@@ -192,6 +219,9 @@ class LuxReadSession:
         self._split_request_deadlines = (
             drain_timeout is not None or reply_timeout is not None
         )
+        self._tcp_keepalive = tcp_keepalive
+        self._tcp_keepalive_idle_seconds = tcp_keepalive_idle_seconds
+        self._receive_inactivity_timeout = receive_inactivity_timeout
         self._diagnostics = LuxReadDiagnosticJournal(
             monotonic=diagnostic_monotonic,
             event_capacity=diagnostic_event_capacity,
@@ -237,6 +267,11 @@ class LuxReadSession:
         self._request_timeouts = 0
         self._ambiguous_requests = 0
         self._modbus_rejections = 0
+        self._tcp_keepalive_applied_connections = 0
+        self._tcp_keepalive_idle_applied_connections = 0
+        self._tcp_keepalive_configuration_failures = 0
+        self._tcp_keepalive_configuration_unavailable = 0
+        self._receive_inactivity_timeouts = 0
         self._connection_losses = 0
         self._operational_registers_expected = 0
         self._operational_registers_unmatched = 0
@@ -276,6 +311,21 @@ class LuxReadSession:
     def split_request_deadlines(self) -> bool:
         """Whether drain and reply phases use independent timeout budgets."""
         return self._split_request_deadlines
+
+    @property
+    def tcp_keepalive_enabled(self) -> bool:
+        """Whether new sockets request best-effort OS TCP keepalive."""
+        return self._tcp_keepalive
+
+    @property
+    def tcp_keepalive_idle_seconds(self) -> int:
+        """Requested idle time before the OS begins TCP keepalive probing."""
+        return self._tcp_keepalive_idle_seconds
+
+    @property
+    def receive_inactivity_timeout_seconds(self) -> float | None:
+        """Maximum application-byte silence before retiring a generation."""
+        return self._receive_inactivity_timeout
 
     async def async_connect(self) -> None:
         """Connect and immediately start the sole socket reader."""
@@ -357,6 +407,11 @@ class LuxReadSession:
             raise LuxPowerConnectionError(
                 "frame-aware read connection could not be established"
             ) from exc
+        try:
+            self._configure_tcp_keepalive(writer)
+        except BaseException:
+            await self._close_writer(writer)
+            raise
         self._generation += 1
         generation = self._generation
         decoder = LuxFrameDecoder()
@@ -644,6 +699,19 @@ class LuxReadSession:
             connection_failures=self._connection_failures,
             ambiguous_requests=self._ambiguous_requests,
             modbus_rejections=self._modbus_rejections,
+            tcp_keepalive_applied_connections=(
+                self._tcp_keepalive_applied_connections
+            ),
+            tcp_keepalive_idle_applied_connections=(
+                self._tcp_keepalive_idle_applied_connections
+            ),
+            tcp_keepalive_configuration_failures=(
+                self._tcp_keepalive_configuration_failures
+            ),
+            tcp_keepalive_configuration_unavailable=(
+                self._tcp_keepalive_configuration_unavailable
+            ),
+            receive_inactivity_timeouts=self._receive_inactivity_timeouts,
         )
 
     def diagnostics(self) -> LuxReadDiagnosticsSnapshot:
@@ -657,18 +725,49 @@ class LuxReadSession:
         decoder: LuxFrameDecoder,
     ) -> None:
         error: BaseException | None = None
+        loop = asyncio.get_running_loop()
+        receive_deadline = (
+            loop.time() + self._receive_inactivity_timeout
+            if self._receive_inactivity_timeout is not None
+            else None
+        )
         try:
             while generation == self._generation:
-                if decoder.stats().buffered_bytes:
+                partial_frame = bool(decoder.stats().buffered_bytes)
+                read_timeout = _PARTIAL_FRAME_TIMEOUT if partial_frame else None
+                if receive_deadline is not None:
+                    remaining_inactivity = max(
+                        0.0,
+                        receive_deadline - loop.time(),
+                    )
+                    read_timeout = (
+                        remaining_inactivity
+                        if read_timeout is None
+                        else min(read_timeout, remaining_inactivity)
+                    )
+                if read_timeout is not None:
                     try:
                         chunk = await asyncio.wait_for(
                             reader.read(_READER_CHUNK_SIZE),
-                            timeout=_PARTIAL_FRAME_TIMEOUT,
+                            timeout=read_timeout,
                         )
                     except asyncio.TimeoutError:
                         if generation != self._generation:
                             return
-                        if decoder.discard_partial():
+                        if (
+                            receive_deadline is not None
+                            and loop.time() >= receive_deadline
+                        ):
+                            self._receive_inactivity_timeouts += 1
+                            self._diagnostics.record_event(
+                                LuxDiagnosticEventKind.RECEIVE_INACTIVITY_TIMEOUT,
+                                generation,
+                                request=self._pending_diagnostic(generation),
+                            )
+                            raise ConnectionResetError(
+                                "LuxPower application receive inactivity timeout"
+                            )
+                        if partial_frame and decoder.discard_partial():
                             self._invalid_frames += 1
                             self._diagnostics.observe_invalid(
                                 generation,
@@ -684,6 +783,10 @@ class LuxReadSession:
                     return
                 if not chunk:
                     raise ConnectionResetError("LuxPower socket closed")
+                if self._receive_inactivity_timeout is not None:
+                    receive_deadline = (
+                        loop.time() + self._receive_inactivity_timeout
+                    )
                 self._bytes_received += len(chunk)
                 malformed_before = decoder.stats().malformed_lengths
                 frames = decoder.feed(chunk)
@@ -708,6 +811,53 @@ class LuxReadSession:
             )
             if generation == self._generation and error is not None:
                 await self._reader_failed(generation, error)
+
+    def _configure_tcp_keepalive(
+        self,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        """Apply conservative TCP keepalive without making connect depend on it."""
+        if not self._tcp_keepalive:
+            return
+        get_extra_info = getattr(writer, "get_extra_info", None)
+        if get_extra_info is None:
+            self._tcp_keepalive_configuration_unavailable += 1
+            return
+        try:
+            transport_socket = get_extra_info("socket")
+        except Exception:
+            self._tcp_keepalive_configuration_failures += 1
+            return
+        if transport_socket is None or not hasattr(transport_socket, "setsockopt"):
+            self._tcp_keepalive_configuration_unavailable += 1
+            return
+        try:
+            transport_socket.setsockopt(
+                socket.SOL_SOCKET,
+                socket.SO_KEEPALIVE,
+                1,
+            )
+        except Exception:
+            self._tcp_keepalive_configuration_failures += 1
+            return
+        self._tcp_keepalive_applied_connections += 1
+
+        idle_option = getattr(socket, "TCP_KEEPIDLE", None)
+        if idle_option is None:
+            idle_option = getattr(socket, "TCP_KEEPALIVE", None)
+        if idle_option is None:
+            self._tcp_keepalive_configuration_unavailable += 1
+            return
+        try:
+            transport_socket.setsockopt(
+                socket.IPPROTO_TCP,
+                idle_option,
+                self._tcp_keepalive_idle_seconds,
+            )
+        except Exception:
+            self._tcp_keepalive_configuration_failures += 1
+            return
+        self._tcp_keepalive_idle_applied_connections += 1
 
     def _route_frame(self, frame: bytes, generation: int) -> None:
         if generation != self._generation:

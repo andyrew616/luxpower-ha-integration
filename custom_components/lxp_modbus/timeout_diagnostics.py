@@ -54,6 +54,7 @@ class LuxDiagnosticEventKind(str, Enum):
     CLOSE_STARTED = "close_started"
     CLOSE_COMPLETED = "close_completed"
     READER_EXIT = "reader_exit"
+    RECEIVE_INACTIVITY_TIMEOUT = "receive_inactivity_timeout"
     CONNECTION_LOST = "connection_lost"
     REQUEST_TERMINAL = "request_terminal"
 
@@ -227,7 +228,7 @@ class _DiagnosticRequestState:
 class LuxReadDiagnosticJournal:
     """Non-blocking bounded journal which never stores packets or register values."""
 
-    SCHEMA_VERSION = 3
+    SCHEMA_VERSION = 4
 
     def __init__(
         self,

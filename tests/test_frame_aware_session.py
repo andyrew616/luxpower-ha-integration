@@ -2,10 +2,12 @@
 
 import asyncio
 from datetime import datetime, timezone
+import socket
 from unittest.mock import AsyncMock
 
 import pytest
 
+from custom_components.lxp_modbus.classes import read_session as read_session_module
 from custom_components.lxp_modbus.classes.frame_decoder import LuxFrameDecoder
 from custom_components.lxp_modbus.classes.lxp_packet_utils import LxpPacketUtils
 from custom_components.lxp_modbus.classes.lxp_request_builder import LxpRequestBuilder
@@ -16,6 +18,7 @@ from custom_components.lxp_modbus.classes.read_session import (
 from custom_components.lxp_modbus.exceptions import (
     LuxPowerAmbiguousRequestError,
     LuxPowerConnectionError,
+    LuxPowerConnectionLostError,
     LuxPowerCommunicationError,
     LuxPowerReadTimeoutError,
     LuxPowerSessionClosedError,
@@ -91,8 +94,9 @@ class QueueReader:
 
 
 class FakeWriter:
-    def __init__(self, on_write=None):
+    def __init__(self, on_write=None, socket_info=None):
         self.on_write = on_write
+        self.socket_info = socket_info
         self.packets = []
         self.closed = False
 
@@ -109,6 +113,9 @@ class FakeWriter:
 
     async def wait_closed(self):
         return None
+
+    def get_extra_info(self, name, default=None):
+        return self.socket_info if name == "socket" else default
 
 
 def make_session(reader, writer, **kwargs):
@@ -490,6 +497,374 @@ async def test_connection_establishment_failure_is_typed_and_counted():
 
     assert session.metrics().connection_attempts == 1
     assert session.metrics().connection_failures == 1
+
+
+@pytest.mark.asyncio
+async def test_connect_applies_best_effort_tcp_keepalive_without_probe_cadence():
+    class RecordingSocket:
+        def __init__(self):
+            self.options = []
+
+        def setsockopt(self, level, option, value):
+            self.options.append((level, option, value))
+
+    transport_socket = RecordingSocket()
+    writer = FakeWriter(socket_info=transport_socket)
+    session = make_session(QueueReader(), writer)
+
+    await session.async_connect()
+
+    assert transport_socket.options[0] == (
+        socket.SOL_SOCKET,
+        socket.SO_KEEPALIVE,
+        1,
+    )
+    idle_option = getattr(
+        socket,
+        "TCP_KEEPIDLE",
+        getattr(socket, "TCP_KEEPALIVE", None),
+    )
+    if idle_option is None:
+        assert transport_socket.options == [transport_socket.options[0]]
+        assert session.metrics().tcp_keepalive_configuration_unavailable == 1
+    else:
+        assert transport_socket.options[1] == (
+            socket.IPPROTO_TCP,
+            idle_option,
+            60,
+        )
+        assert len(transport_socket.options) == 2
+        assert session.metrics().tcp_keepalive_idle_applied_connections == 1
+    assert session.metrics().tcp_keepalive_applied_connections == 1
+    assert session.metrics().tcp_keepalive_configuration_failures == 0
+    await session.async_close()
+
+
+@pytest.mark.asyncio
+async def test_keepalive_configuration_failure_does_not_fail_connection():
+    class UnsupportedSocket:
+        def setsockopt(self, _level, _option, _value):
+            raise OSError("unsupported")
+
+    writer = FakeWriter(socket_info=UnsupportedSocket())
+    session = make_session(QueueReader(), writer)
+
+    await session.async_connect()
+
+    assert session.connected is True
+    assert session.metrics().connection_failures == 0
+    assert session.metrics().tcp_keepalive_configuration_failures == 1
+    await session.async_close()
+
+
+@pytest.mark.asyncio
+async def test_keepalive_uses_platform_idle_fallback(monkeypatch):
+    class RecordingSocket:
+        def __init__(self):
+            self.options = []
+
+        def setsockopt(self, level, option, value):
+            self.options.append((level, option, value))
+
+    fallback_option = 0xCAFE
+    monkeypatch.delattr(socket, "TCP_KEEPIDLE", raising=False)
+    monkeypatch.setattr(socket, "TCP_KEEPALIVE", fallback_option, raising=False)
+    transport_socket = RecordingSocket()
+    session = make_session(
+        QueueReader(),
+        FakeWriter(socket_info=transport_socket),
+    )
+
+    await session.async_connect()
+
+    assert transport_socket.options[-1] == (
+        socket.IPPROTO_TCP,
+        fallback_option,
+        60,
+    )
+    assert session.metrics().tcp_keepalive_idle_applied_connections == 1
+    await session.async_close()
+
+
+@pytest.mark.asyncio
+async def test_keepalive_idle_option_unavailable_is_nonfatal(monkeypatch):
+    class RecordingSocket:
+        def setsockopt(self, _level, _option, _value):
+            return None
+
+    monkeypatch.delattr(socket, "TCP_KEEPIDLE", raising=False)
+    monkeypatch.delattr(socket, "TCP_KEEPALIVE", raising=False)
+    session = make_session(
+        QueueReader(),
+        FakeWriter(socket_info=RecordingSocket()),
+    )
+
+    await session.async_connect()
+
+    metrics = session.metrics()
+    assert metrics.tcp_keepalive_applied_connections == 1
+    assert metrics.tcp_keepalive_idle_applied_connections == 0
+    assert metrics.tcp_keepalive_configuration_unavailable == 1
+    await session.async_close()
+
+
+@pytest.mark.asyncio
+async def test_keepalive_idle_option_failure_keeps_base_keepalive(monkeypatch):
+    class BaseOnlySocket:
+        def __init__(self):
+            self.calls = 0
+
+        def setsockopt(self, _level, _option, _value):
+            self.calls += 1
+            if self.calls == 2:
+                raise OSError("idle option unsupported")
+
+    monkeypatch.setattr(socket, "TCP_KEEPIDLE", 0xCAFE, raising=False)
+    session = make_session(
+        QueueReader(),
+        FakeWriter(socket_info=BaseOnlySocket()),
+    )
+
+    await session.async_connect()
+
+    metrics = session.metrics()
+    assert metrics.tcp_keepalive_applied_connections == 1
+    assert metrics.tcp_keepalive_idle_applied_connections == 0
+    assert metrics.tcp_keepalive_configuration_failures == 1
+    await session.async_close()
+
+
+@pytest.mark.asyncio
+async def test_keepalive_not_implemented_is_nonfatal():
+    class UnsupportedWriter(FakeWriter):
+        def get_extra_info(self, _name, default=None):
+            raise NotImplementedError
+
+    writer = UnsupportedWriter()
+    session = make_session(QueueReader(), writer)
+
+    await session.async_connect()
+
+    assert session.connected is True
+    assert writer.closed is False
+    assert session.metrics().tcp_keepalive_configuration_failures == 1
+    await session.async_close()
+
+
+@pytest.mark.asyncio
+async def test_unexpected_post_connect_setup_failure_closes_writer():
+    class FatalSocketLookup(BaseException):
+        pass
+
+    class FatalWriter(FakeWriter):
+        def get_extra_info(self, _name, default=None):
+            raise FatalSocketLookup
+
+    writer = FatalWriter()
+    session = make_session(QueueReader(), writer)
+
+    with pytest.raises(FatalSocketLookup):
+        await session.async_connect()
+
+    assert writer.closed is True
+    assert session.connected is False
+
+
+@pytest.mark.asyncio
+async def test_keepalive_can_be_disabled_without_inspecting_socket():
+    class UnexpectedSocketUse:
+        def setsockopt(self, _level, _option, _value):
+            raise AssertionError("keepalive must remain disabled")
+
+    writer = FakeWriter(socket_info=UnexpectedSocketUse())
+    session = make_session(QueueReader(), writer, tcp_keepalive=False)
+
+    await session.async_connect()
+
+    assert session.metrics().tcp_keepalive_applied_connections == 0
+    assert session.metrics().tcp_keepalive_configuration_failures == 0
+    await session.async_close()
+
+
+@pytest.mark.asyncio
+async def test_receive_inactivity_retires_generation_without_refreshing_values():
+    reader = QueueReader()
+    writer = FakeWriter()
+    session = make_session(
+        reader,
+        writer,
+        tcp_keepalive=False,
+        receive_inactivity_timeout=0.02,
+    )
+    await session.async_connect()
+
+    await asyncio.sleep(0.04)
+
+    assert session.connected is False
+    assert writer.closed is True
+    assert session.metrics().receive_inactivity_timeouts == 1
+    assert session.metrics().connection_losses == 1
+    assert session.snapshot().input_registers == {}
+    event_kinds = [event.kind.value for event in session.diagnostics().events]
+    assert event_kinds[-3:] == [
+        "receive_inactivity_timeout",
+        "reader_exit",
+        "connection_lost",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_receive_inactivity_uses_event_loop_not_measurement_clock():
+    session = make_session(
+        QueueReader(),
+        FakeWriter(),
+        tcp_keepalive=False,
+        receive_inactivity_timeout=0.02,
+        monotonic=lambda: 0.0,
+    )
+    await session.async_connect()
+
+    await asyncio.sleep(0.04)
+
+    assert session.connected is False
+    assert session.metrics().receive_inactivity_timeouts == 1
+
+
+@pytest.mark.asyncio
+async def test_received_bytes_reset_inactivity_but_not_telemetry_freshness():
+    reader = QueueReader()
+    session = make_session(
+        reader,
+        FakeWriter(),
+        tcp_keepalive=False,
+        receive_inactivity_timeout=0.04,
+    )
+    await session.async_connect()
+
+    await asyncio.sleep(0.025)
+    reader.feed(input_response(0, serial=b"OTHERINV01"))
+    await asyncio.sleep(0.025)
+
+    assert session.connected is True
+    assert session.snapshot().input_registers == {}
+    assert session.metrics().invalid_frames == 1
+
+    await asyncio.sleep(0.035)
+    assert session.connected is False
+    assert session.metrics().receive_inactivity_timeouts == 1
+
+
+@pytest.mark.asyncio
+async def test_partial_frame_cleanup_preserves_last_byte_inactivity_deadline(
+    monkeypatch,
+):
+    monkeypatch.setattr(read_session_module, "_PARTIAL_FRAME_TIMEOUT", 0.02)
+    reader = QueueReader()
+    session = make_session(
+        reader,
+        FakeWriter(),
+        tcp_keepalive=False,
+        receive_inactivity_timeout=0.06,
+    )
+    await session.async_connect()
+
+    await asyncio.sleep(0.01)
+    reader.feed(input_response(0)[:20])
+    await asyncio.sleep(0.03)
+
+    assert session.connected is True
+    assert session.metrics().invalid_frames == 1
+
+    await asyncio.sleep(0.04)
+
+    assert session.connected is False
+    assert session.metrics().receive_inactivity_timeouts == 1
+    assert session.snapshot().input_registers == {}
+
+
+@pytest.mark.asyncio
+async def test_receive_inactivity_fails_pending_request_as_connection_loss():
+    reader = QueueReader()
+    session = make_session(
+        reader,
+        FakeWriter(),
+        tcp_keepalive=False,
+        receive_inactivity_timeout=0.02,
+        reply_timeout=1,
+    )
+    await session.async_connect()
+
+    with pytest.raises(LuxPowerConnectionLostError):
+        await session.async_read_input(0, 40)
+
+    assert session.metrics().request_timeouts == 0
+    assert session.metrics().receive_inactivity_timeouts == 1
+    assert session.snapshot().input_registers == {}
+
+
+@pytest.mark.asyncio
+async def test_receive_inactivity_cleanup_cannot_cross_reconnect_generation():
+    old_reader = QueueReader()
+    new_reader = QueueReader()
+    old_writer = FakeWriter()
+    new_writer = FakeWriter(
+        lambda _packet: new_reader.feed(input_response(0))
+    )
+    connections = iter(((old_reader, old_writer), (new_reader, new_writer)))
+
+    async def connector(_host, _port):
+        return next(connections)
+
+    session = LuxReadSession(
+        "192.0.2.1",
+        DONGLE.decode(),
+        INVERTER.decode(),
+        connector=connector,
+        tcp_keepalive=False,
+        receive_inactivity_timeout=0.02,
+    )
+    await session.async_connect()
+    await session._lifecycle_lock.acquire()
+    await asyncio.sleep(0.04)
+
+    # The reader has reached its inactivity failure but is blocked entering
+    # generation-scoped cleanup. Bytes queued on that reader remain harmless.
+    old_reader.feed(input_response(0))
+    await asyncio.sleep(0.01)
+    assert session.snapshot().input_registers == {}
+
+    session._lifecycle_lock.release()
+    for _ in range(20):
+        if not session.connected:
+            break
+        await asyncio.sleep(0.005)
+    assert session.connected is False
+    assert old_writer.closed is True
+
+    await session.async_connect()
+    observation = await session.async_read_input(0, 40)
+
+    assert observation.explicit_response is True
+    assert session.metrics().connections == 2
+    assert session.metrics().receive_inactivity_timeouts == 1
+    assert session.metrics().expected_fc4_responses == 1
+    await session.async_close()
+
+
+@pytest.mark.parametrize("value", [0, -1, float("inf"), float("nan")])
+def test_receive_inactivity_timeout_must_be_finite_and_positive(value):
+    with pytest.raises(ValueError, match="receive_inactivity_timeout"):
+        make_session(QueueReader(), FakeWriter(), receive_inactivity_timeout=value)
+
+
+@pytest.mark.parametrize("value", [0, -1, True, 1.5, "60"])
+def test_keepalive_idle_must_be_a_positive_integer(value):
+    with pytest.raises(ValueError, match="tcp_keepalive_idle_seconds"):
+        make_session(
+            QueueReader(),
+            FakeWriter(),
+            tcp_keepalive_idle_seconds=value,
+        )
 
 
 @pytest.mark.asyncio

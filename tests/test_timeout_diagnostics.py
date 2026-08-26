@@ -210,7 +210,7 @@ def test_diagnostic_records_independent_phase_budgets():
 
     request = journal.finalize_request(state, LuxReadRequestOutcome.SUCCESS)
 
-    assert journal.snapshot().schema_version == 3
+    assert journal.snapshot().schema_version == 4
     assert request.timeout_budget_ms == 10000
     assert request.drain_timeout_budget_ms == 1000
     assert request.reply_timeout_budget_ms == 10000
