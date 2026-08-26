@@ -1253,6 +1253,9 @@ def aggregate_qualification_reports(
         ),
         "recovery_totals": recovery_totals,
         "health_state_duration_seconds": health_state_duration_seconds,
+        "observation_delivery_complete": bool(
+            session_totals["observation_queue_drops"] == 0
+        ),
         "explicit_requests_avoided_unsolicited": avoided,
         "observed_rates": {
             "timeouts_per_explicit_request": (
@@ -1331,12 +1334,9 @@ async def _run_profile_phase(
         after_profile.explicit_requests_avoided_unsolicited
         - before_profile.explicit_requests_avoided_unsolicited
     )
-    unsafe_events = sum(
-        session_delta[field]
-        for field in (
-            "invalid_frames",
-            "observation_queue_drops",
-        )
+    unsafe_events = session_delta["invalid_frames"]
+    observation_delivery_complete = bool(
+        session_delta["observation_queue_drops"] == 0
     )
     recovery_delta = _recovery_metrics_delta(before_recovery, after_recovery)
     streamed = freshness_evidence.finalize(recovery_delta["events"])
@@ -1398,9 +1398,13 @@ async def _run_profile_phase(
         "freshness_evidence_complete": streamed["evidence_complete"],
         "freshness_retention": streamed["bounded_retention"],
         "transport_recovery_safe": recovery_safe,
+        "observation_delivery_complete": observation_delivery_complete,
         "freshness_target_met": freshness_met,
         "target_met": bool(
-            recovery_safe and freshness_met and streamed["evidence_complete"]
+            recovery_safe
+            and observation_delivery_complete
+            and freshness_met
+            and streamed["evidence_complete"]
         ),
         "request_diagnostics": _diagnostic_delta(
             before_diagnostics,

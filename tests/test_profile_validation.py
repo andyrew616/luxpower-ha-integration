@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 import sys
 from types import SimpleNamespace
+from dataclasses import replace
 from datetime import timedelta
 
 import pytest
@@ -41,6 +42,7 @@ from luxpower.profile_validation import (
     _time_beyond_target_by_recovery_episode,
     _time_by_health_state,
     _validate_deadline_options,
+    _run_profile_phase,
     _verify_live_source_revision,
     _violation_episode_summary,
     _write_private_report,
@@ -951,6 +953,69 @@ def _zero_session_metrics():
         decoder_discarded_bytes=0,
         decoder_buffered_bytes=0,
     )
+
+
+@pytest.mark.asyncio
+async def test_delivery_drop_is_separate_from_transport_recovery_safety():
+    class DeliveryDropClient:
+        def __init__(self):
+            self.dropped = False
+
+        def metrics(self):
+            return replace(
+                _zero_session_metrics(),
+                observation_queue_drops=int(self.dropped),
+            )
+
+        def profile_metrics(self):
+            return HybridProfileMetrics(0, 0, 0)
+
+        def recovery_metrics(self):
+            return RecoveryMetrics(
+                health=AcquisitionHealth.HEALTHY,
+                timeout_count=0,
+                connection_loss_count=0,
+                connection_establishment_failure_count=0,
+                ambiguous_request_count=0,
+                reconnect_attempts=0,
+                successful_reconnects=0,
+                failed_reconnects=0,
+                completed_recoveries=0,
+                retry_budget_exhausted=0,
+                acquisitions_abandoned=0,
+                connection_generations_created=1,
+            )
+
+        async def async_run_profile(self, _duration, *, sample_sink):
+            now = utc_now()
+            for offset in (0.0, 0.1):
+                sample_sink.append(
+                    {
+                        "at": (now + timedelta(seconds=offset)).isoformat(),
+                        "acquisition_health": "healthy",
+                        "profile_freshness": {
+                            "known": 1,
+                            "required": 1,
+                            "median_age_seconds": 1.0,
+                            "max_age_seconds": 1.0,
+                            "max_age_seconds_raw": 1.0,
+                            "worst_register": 0,
+                        },
+                    }
+                )
+            self.dropped = True
+
+    phase = await _run_profile_phase(
+        DeliveryDropClient(),
+        name="delivery_drop",
+        target_seconds=20.0,
+        duration_seconds=0.1,
+    )
+
+    assert phase["transport_recovery_safe"] is True
+    assert phase["observation_delivery_complete"] is False
+    assert phase["freshness_target_met"] is True
+    assert phase["target_met"] is False
 
 
 @pytest.mark.asyncio

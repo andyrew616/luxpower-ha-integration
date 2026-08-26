@@ -25,6 +25,8 @@ from custom_components.lxp_modbus.exceptions import (
     LuxPowerSessionClosedError,
 )
 from custom_components.lxp_modbus.classes.read_session import (
+    LuxObservationSubscription,
+    LuxObservationSubscriptionSnapshot,
     LuxObservationSource,
     LuxReadObservation,
     LuxReadSession,
@@ -73,6 +75,8 @@ __all__ = [
     "LuxPowerReadTimeoutError",
     "LuxPowerSessionClosedError",
     "LuxReadObservation",
+    "LuxObservationSubscription",
+    "LuxObservationSubscriptionSnapshot",
     "LuxObservationSource",
     "LuxReadSession",
     "LuxReadSessionMetrics",
