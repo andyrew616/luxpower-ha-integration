@@ -1,5 +1,6 @@
 """Tests for read-only critical-profile live validation helpers."""
 
+import copy
 import json
 import os
 from pathlib import Path
@@ -38,6 +39,7 @@ from luxpower.profile_validation import (
     _time_beyond_target,
     _time_beyond_target_by_health_state,
     _time_beyond_target_by_recovery_episode,
+    _time_by_health_state,
     _validate_deadline_options,
     _verify_live_source_revision,
     _violation_episode_summary,
@@ -106,6 +108,11 @@ def test_time_beyond_target_uses_actual_sample_intervals():
         "while_recovering": 0.125,
         "outside_recovering": 0.0,
     }
+    assert _time_by_health_state(samples) == {
+        "healthy": 0.115,
+        "recovering": 0.125,
+        "degraded": 0.0,
+    }
     events = [{
         "episode_started_at": "2026-08-25T11:59:59.900000+00:00",
         "ended_at": "2026-08-25T12:00:00.200000+00:00",
@@ -143,6 +150,7 @@ def test_strict_ten_second_episodes_include_recovery_and_boundary_maximum():
     assert episodes["count"] == 1
     assert episodes["longest_duration_seconds"] == 2.0
     assert episodes["episodes"][0]["cause"] == ["request_timeout"]
+    assert episodes["episodes"][0]["right_censored"] is False
     assert _time_beyond_target(samples, 10.0) == 2.0
 
 
@@ -166,7 +174,30 @@ def test_strict_sla_uses_unrounded_age_just_over_target():
     ]
 
     assert _time_beyond_target(samples, 10.0) == 0.1
-    assert _violation_episode_summary(samples, 10.0, [])["count"] == 1
+    episodes = _violation_episode_summary(samples, 10.0, [])
+    assert episodes["count"] == 1
+    assert episodes["episodes"][0]["right_censored"] is False
+
+
+def test_terminal_stale_episode_is_explicitly_right_censored():
+    samples = [
+        {
+            "at": f"2026-08-25T12:00:00.{suffix}+00:00",
+            "acquisition_health": "recovering",
+            "profile_freshness": {
+                "known": 1,
+                "required": 1,
+                "max_age_seconds": age,
+                "worst_register": 114,
+            },
+        }
+        for suffix, age in (("000000", 10.1), ("100000", 10.2))
+    ]
+
+    episodes = _violation_episode_summary(samples, 10.0, [])
+
+    assert episodes["count"] == 1
+    assert episodes["episodes"][0]["right_censored"] is True
 
 
 def test_request_latency_distribution_and_timeout_thresholds():
@@ -408,6 +439,82 @@ def test_schema_v6_aggregation_requires_matching_liveness_configuration():
         aggregate_qualification_reports(reports)
 
 
+def test_schema_v7_aggregation_requires_matching_recovery_policy():
+    report = _qualification_report(
+        timeout=0,
+        reconnect=0,
+        target_met=True,
+        maximum=8.0,
+        values=[700.0] * 100,
+    )
+    report["schema_version"] = 7
+    report["phases"][0]["session_metrics"].update(
+        {
+            "tcp_keepalive_applied_connections": 1,
+            "tcp_keepalive_idle_applied_connections": 1,
+            "tcp_keepalive_configuration_failures": 0,
+            "tcp_keepalive_configuration_unavailable": 0,
+            "receive_inactivity_timeouts": 0,
+        }
+    )
+    report["profile"] = {
+        "definition_version": 1,
+        "name": "energy_flow",
+        "required_registers": [0, 114],
+        "blocks": [{"start": 0, "count": 40}, {"start": 80, "count": 40}],
+    }
+    report["provenance"] = {
+        "implementation_revision": "a" * 40,
+        "profile_definition_version": 1,
+        "drain_timeout_seconds": 3,
+        "reply_timeout_seconds": 10,
+        "split_request_deadlines": True,
+        "tcp_keepalive_enabled": True,
+        "tcp_keepalive_idle_seconds": 60,
+        "receive_inactivity_timeout_seconds": 900.0,
+    }
+    report["recovery_policy"] = {
+        "max_reconnects_per_acquisition": 1,
+        "max_reconnects_per_window": 2,
+        "max_connection_attempts_per_reconnect": 3,
+        "rolling_window_seconds": 300.0,
+        "initial_cooldown_seconds": 1.0,
+        "repeated_cooldown_seconds": 5.0,
+    }
+    report["phases"][0]["sampled_time_by_health_state_seconds"] = {
+        "healthy": 1790.0,
+        "recovering": 10.0,
+        "degraded": 0.0,
+    }
+    report["phases"][0]["violation_episodes"]["episodes"] = [
+        {"right_censored": False}
+    ]
+    reports = [report, copy.deepcopy(report)]
+    reports[1]["phases"][0]["violation_episodes"]["episodes"] = [
+        {"right_censored": True}
+    ]
+
+    aggregate = aggregate_qualification_reports(reports)
+    assert aggregate["source_report_schema_version"] == 7
+    assert aggregate["schema_version"] == 3
+    assert aggregate["liveness_configuration"] == {
+        "tcp_keepalive_enabled": True,
+        "tcp_keepalive_idle_seconds": 60,
+        "receive_inactivity_timeout_seconds": 900.0,
+    }
+    assert aggregate["health_state_duration_seconds"] == {
+        "healthy": 3580.0,
+        "recovering": 20.0,
+        "degraded": 0.0,
+    }
+    assert aggregate["freshness"]["right_censored_episode_count"] == 1
+    assert aggregate["freshness"]["runs_ending_stale"] == 1
+
+    reports[1]["recovery_policy"]["max_connection_attempts_per_reconnect"] = 2
+    with pytest.raises(ValueError, match="different revisions, profiles"):
+        aggregate_qualification_reports(reports)
+
+
 def test_live_qualification_requires_both_phase_deadlines():
     _validate_deadline_options(None, None)
     _validate_deadline_options(3, 10)
@@ -581,8 +688,8 @@ async def test_short_only_schema_v5_provenance_and_intentional_shutdown_health()
         implementation_revision="a" * 40,
     )
 
-    assert report["schema_version"] == 6
-    assert report["validation_version"] == "6.0"
+    assert report["schema_version"] == 7
+    assert report["validation_version"] == "7.0"
     assert report["provenance"] == {
         "implementation_revision": "a" * 40,
         "revision_source": "operator_supplied",

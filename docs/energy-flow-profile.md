@@ -77,13 +77,17 @@ request timeout, connection loss, or ambiguous request taints and closes the
 current frame-aware connection before a clean generation is opened. Cached
 values and their original `observed_at` timestamps are retained throughout.
 
-The conservative default policy permits one reconnect within one acquisition
-and two reconnects in a rolling five-minute window. The first reconnect waits
-one second; another recovery in the same window waits five seconds. Exhaustion
-is explicit through `LuxPowerRecoveryExhaustedError` and `degraded` acquisition
-health. Explicit Modbus rejection, cancellation, and shutdown are never blindly
-retried. After reconnect, freshness is evaluated again and only stale required
-profile blocks are requested; recovery never triggers a full input scan.
+The conservative default policy permits one reconnect episode within one
+acquisition and two episodes in a rolling five-minute window. The first episode
+waits one second; another episode in the same window waits five seconds. Within
+an episode, TCP establishment is attempted at most three times, with the same
+five-second shutdown-aware cooldown between failed dials. A failed dial creates
+no connection generation and never retries FC4. Exhausted dials abandon the
+acquisition explicitly and expose `degraded` health; exhaustion of the episode
+budget remains explicit through `LuxPowerRecoveryExhaustedError`. Explicit
+Modbus rejection, cancellation, and shutdown are never blindly retried. After
+reconnect, freshness is evaluated again and only stale required profile blocks
+are requested; recovery never triggers a full input scan.
 
 ## Read-only hardware validation status
 

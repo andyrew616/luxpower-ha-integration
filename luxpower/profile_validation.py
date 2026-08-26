@@ -42,8 +42,8 @@ from luxpower.hybrid import (
     _metrics_delta,
 )
 
-PROFILE_VALIDATION_SCHEMA_VERSION = 6
-PROFILE_VALIDATION_VERSION = "6.0"
+PROFILE_VALIDATION_SCHEMA_VERSION = 7
+PROFILE_VALIDATION_VERSION = "7.0"
 
 
 def _maximum_age(freshness: Mapping[str, object]) -> float | None:
@@ -138,6 +138,22 @@ def _time_beyond_target_by_health_state(
     return {name: round(value, 3) for name, value in totals.items()}
 
 
+def _time_by_health_state(
+    samples: Sequence[Mapping[str, object]],
+) -> dict[str, float]:
+    """Integrate all sampled operational time by acquisition health."""
+    totals = {"healthy": 0.0, "recovering": 0.0, "degraded": 0.0}
+    for current, following in zip(samples, samples[1:]):
+        state = str(current.get("acquisition_health", "degraded"))
+        if state not in totals:
+            state = "degraded"
+        totals[state] += (
+            datetime.fromisoformat(str(following["at"]))
+            - datetime.fromisoformat(str(current["at"]))
+        ).total_seconds()
+    return {name: round(value, 3) for name, value in totals.items()}
+
+
 def _time_beyond_target_by_recovery_episode(
     samples: Sequence[Mapping[str, object]],
     target_seconds: float,
@@ -219,11 +235,20 @@ def _violation_episode_summary(
         if active is not None:
             episodes.append(active)
             active = None
+    final_sample_stale = False
+    if samples:
+        final_freshness = samples[-1]["profile_freshness"]
+        final_sample_stale = bool(
+            _maximum_age(final_freshness) is None
+            or final_freshness["known"] != final_freshness["required"]
+            or _maximum_age(final_freshness) > target_seconds
+        )
+    right_censored = active is not None and final_sample_stale
     if active is not None:
         episodes.append(active)
 
     serialized = []
-    for episode in episodes:
+    for index, episode in enumerate(episodes):
         causes = sorted({
             failure_kind
             for recovery_start, recovery_end, failure_kind in recovery_ranges
@@ -240,6 +265,7 @@ def _violation_episode_summary(
                 else None
             ),
             "cause": causes or ["undetermined_non_recovery"],
+            "right_censored": bool(right_censored and index == len(episodes) - 1),
         })
     durations = [episode["duration_seconds"] for episode in serialized]
     return {
@@ -266,6 +292,8 @@ def _recovery_metrics_delta(before, after) -> dict:
         "retry_budget_exhausted",
         "acquisitions_abandoned",
         "connection_generations_created",
+        "connection_dial_attempts",
+        "failed_connection_dial_attempts",
     )
     result = {name: getattr(after, name) - getattr(before, name) for name in fields}
     result["events"] = [
@@ -513,9 +541,9 @@ def aggregate_qualification_reports(
     """Aggregate sanitized sustained phases without inferring long-term rates."""
     phases: list[tuple[Mapping[str, object], Mapping[str, object]]] = []
     for report in reports:
-        if int(report.get("schema_version", 0)) not in (3, 4, 5, 6):
+        if int(report.get("schema_version", 0)) not in (3, 4, 5, 6, 7):
             raise ValueError(
-                "qualification aggregation requires schema-v3/v4/v5/v6 reports"
+                "qualification aggregation requires schema-v3 through v7 reports"
             )
         phases.extend(
             (report, phase)
@@ -537,7 +565,7 @@ def aggregate_qualification_reports(
         }
         if len(provenance_reports) != len(reports) or len(report_schemas) != 1:
             raise ValueError(
-                "schema-v5/v6 qualification cannot aggregate across schemas"
+                "schema-v5+ qualification cannot aggregate across schemas"
             )
         provenance_keys = [
             "implementation_revision",
@@ -546,7 +574,7 @@ def aggregate_qualification_reports(
             "reply_timeout_seconds",
             "split_request_deadlines",
         ]
-        if report_schemas == {6}:
+        if report_schemas in ({6}, {7}):
             provenance_keys.extend(
                 (
                     "tcp_keepalive_enabled",
@@ -563,7 +591,7 @@ def aggregate_qualification_reports(
                 ]
                 if missing:
                     raise ValueError(
-                        "schema-v6 qualification is missing required provenance"
+                        "schema-v6+ qualification is missing required provenance"
                     )
         provenance_sets = {
             tuple(report["provenance"][key] for key in provenance_keys)
@@ -573,7 +601,20 @@ def aggregate_qualification_reports(
             json.dumps(report.get("profile"), sort_keys=True, separators=(",", ":"))
             for report in provenance_reports
         }
-        if len(provenance_sets) != 1 or len(profile_signatures) != 1:
+        recovery_signatures = {
+            json.dumps(
+                report.get("recovery_policy"),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            for report in provenance_reports
+            if int(report.get("schema_version", 0)) >= 7
+        }
+        if (
+            len(provenance_sets) != 1
+            or len(profile_signatures) != 1
+            or len(recovery_signatures) > 1
+        ):
             raise ValueError(
                 "qualification reports use different revisions, profiles, "
                 "or deadline/liveness configuration"
@@ -631,9 +672,15 @@ def aggregate_qualification_reports(
         "successful_reconnects",
         "failed_reconnects",
         "retry_budget_exhausted",
+        "acquisitions_abandoned",
+        "connection_dial_attempts",
+        "failed_connection_dial_attempts",
     )
     recovery_totals = {
-        field: sum(int(phase["recovery_metrics"][field]) for _, phase in phases)
+        field: sum(
+            int(phase["recovery_metrics"].get(field, 0))
+            for _, phase in phases
+        )
         for field in recovery_fields
     }
     latency_values = [
@@ -661,8 +708,34 @@ def aggregate_qualification_reports(
         float(phase["violation_episodes"]["longest_duration_seconds"])
         for _, phase in phases
     )
+    health_state_duration_seconds = {
+        state: round(
+            sum(
+                float(
+                    phase.get("sampled_time_by_health_state_seconds", {}).get(
+                        state, 0
+                    )
+                )
+                for _, phase in phases
+            ),
+            3,
+        )
+        for state in ("healthy", "recovering", "degraded")
+    }
+    right_censored_episode_count = sum(
+        bool(episode.get("right_censored", False))
+        for _, phase in phases
+        for episode in phase["violation_episodes"].get("episodes", [])
+    )
+    runs_ending_stale = sum(
+        any(
+            bool(episode.get("right_censored", False))
+            for episode in phase["violation_episodes"].get("episodes", [])
+        )
+        for _, phase in phases
+    )
     return {
-        "schema_version": 2,
+        "schema_version": 3 if report_schemas == {7} else 2,
         "source_report_schema_version": (
             next(iter({int(report["schema_version"]) for report, _ in phases}))
             if len({int(report["schema_version"]) for report, _ in phases}) == 1
@@ -698,7 +771,7 @@ def aggregate_qualification_reports(
                     "provenance"
                 ].get("receive_inactivity_timeout_seconds"),
             }
-            if report_schemas == {6}
+            if report_schemas in ({6}, {7})
             else None
         ),
         "sustained_runs": len(phases),
@@ -714,6 +787,7 @@ def aggregate_qualification_reports(
             )
         ),
         "recovery_totals": recovery_totals,
+        "health_state_duration_seconds": health_state_duration_seconds,
         "explicit_requests_avoided_unsolicited": avoided,
         "observed_rates": {
             "timeouts_per_explicit_request": (
@@ -732,6 +806,8 @@ def aggregate_qualification_reports(
             "violating_samples": violations,
             "sampled_time_beyond_target_seconds": round(stale_duration, 3),
             "longest_violation_episode_seconds": round(longest, 3),
+            "right_censored_episode_count": right_censored_episode_count,
+            "runs_ending_stale": runs_ending_stale,
             "maximum_worst_age_seconds": max(
                 float(phase["freshness"]["max_worst_age_seconds"])
                 for _, phase in phases
@@ -853,6 +929,7 @@ async def _run_profile_phase(
             _time_beyond_target(samples, target_seconds), 3
         ),
         "sampled_time_beyond_target_by_health_state_seconds": stale_by_health,
+        "sampled_time_by_health_state_seconds": _time_by_health_state(samples),
         "sampled_time_beyond_target_attribution_seconds": stale_by_episode,
         "violation_episodes": violation_episodes,
         "transport_recovery_safe": recovery_safe,
@@ -1195,6 +1272,12 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--enable-recovery", action="store_true")
     parser.add_argument("--recovery-window-seconds", type=float, default=300)
     parser.add_argument("--recovery-window-attempts", type=int, default=2)
+    parser.add_argument(
+        "--recovery-connection-attempts",
+        type=int,
+        default=3,
+        help="bounded TCP dial attempts inside one recovery episode",
+    )
     parser.add_argument("--recovery-initial-cooldown", type=float, default=1)
     parser.add_argument("--recovery-repeated-cooldown", type=float, default=5)
     parser.add_argument("--output", type=Path)
@@ -1217,6 +1300,9 @@ async def _async_main(arguments: argparse.Namespace) -> int:
         RecoveryPolicy(
             max_reconnects_per_acquisition=1,
             max_reconnects_per_window=arguments.recovery_window_attempts,
+            max_connection_attempts_per_reconnect=(
+                arguments.recovery_connection_attempts
+            ),
             rolling_window_seconds=arguments.recovery_window_seconds,
             initial_cooldown_seconds=arguments.recovery_initial_cooldown,
             repeated_cooldown_seconds=arguments.recovery_repeated_cooldown,
