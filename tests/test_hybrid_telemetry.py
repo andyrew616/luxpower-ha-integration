@@ -510,6 +510,17 @@ def recovery_policy(**changes):
     return RecoveryPolicy(**values)
 
 
+def test_recovery_policy_requires_positive_connection_attempt_limit():
+    with pytest.raises(
+        ValueError, match="max_connection_attempts_per_reconnect must be positive"
+    ):
+        recovery_policy(max_connection_attempts_per_reconnect=0)
+    with pytest.raises(
+        ValueError, match="max_connection_attempts_per_reconnect cannot exceed 5"
+    ):
+        recovery_policy(max_connection_attempts_per_reconnect=6)
+
+
 @pytest.mark.asyncio
 async def test_bounded_recovery_reacquires_only_stale_profile_block():
     profile = standard_profile()
@@ -646,6 +657,90 @@ async def test_cancellation_during_recovery_never_reconnects():
 
 
 @pytest.mark.asyncio
+async def test_shutdown_during_inter_dial_backoff_prevents_another_attempt():
+    profile = standard_profile()
+
+    class FailedDialSignal(RecoverySession):
+        def __init__(self):
+            super().__init__(
+                profile,
+                failures=(LuxPowerReadTimeoutError("synthetic"),),
+                connect_failures=(
+                    None,
+                    LuxPowerConnectionError("transiently offline"),
+                ),
+            )
+            self.failed_dial = asyncio.Event()
+
+        async def async_connect(self):
+            try:
+                await super().async_connect()
+            except LuxPowerConnectionError:
+                self.failed_dial.set()
+                raise
+
+    session = FailedDialSignal()
+    client = LuxPowerHybridReadClient(
+        "192.0.2.1", "TESTDONGLE", "TESTINV001",
+        profile=profile,
+        session=session,
+        recovery_policy=recovery_policy(repeated_cooldown_seconds=1),
+    )
+    await client.async_connect()
+    acquisition = asyncio.create_task(client.async_refresh_profile())
+    await session.failed_dial.wait()
+    await client.async_close()
+
+    with pytest.raises(LuxPowerSessionClosedError):
+        await acquisition
+    assert session.connect_calls == 2
+    assert client.recovery_metrics().connection_dial_attempts == 1
+    assert client.recovery_metrics().events[0].outcome == "shutdown"
+
+
+@pytest.mark.asyncio
+async def test_cancellation_during_inter_dial_backoff_prevents_another_attempt():
+    profile = standard_profile()
+
+    class FailedDialSignal(RecoverySession):
+        def __init__(self):
+            super().__init__(
+                profile,
+                failures=(LuxPowerReadTimeoutError("synthetic"),),
+                connect_failures=(
+                    None,
+                    LuxPowerConnectionError("transiently offline"),
+                ),
+            )
+            self.failed_dial = asyncio.Event()
+
+        async def async_connect(self):
+            try:
+                await super().async_connect()
+            except LuxPowerConnectionError:
+                self.failed_dial.set()
+                raise
+
+    session = FailedDialSignal()
+    client = LuxPowerHybridReadClient(
+        "192.0.2.1", "TESTDONGLE", "TESTINV001",
+        profile=profile,
+        session=session,
+        recovery_policy=recovery_policy(repeated_cooldown_seconds=1),
+    )
+    await client.async_connect()
+    acquisition = asyncio.create_task(client.async_refresh_profile())
+    await session.failed_dial.wait()
+    acquisition.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await acquisition
+    assert session.connect_calls == 2
+    assert client.recovery_metrics().connection_dial_attempts == 1
+    assert client.recovery_metrics().events[0].outcome == "cancelled"
+
+
+@pytest.mark.asyncio
 async def test_cancellation_during_reacquisition_terminalizes_recovery():
     profile = standard_profile()
     session = RecoverySession(
@@ -762,21 +857,76 @@ async def test_eof_and_unsolicited_recovery_are_source_aware():
 
 
 @pytest.mark.asyncio
-async def test_failed_reconnect_and_modbus_rejection_are_not_blindly_retried():
+async def test_transient_failed_reconnect_is_bounded_then_reacquires():
     profile = standard_profile()
     failed_connect = RecoverySession(
         profile,
-        failures=(LuxPowerReadTimeoutError("synthetic"),),
-        connect_failures=(None, LuxPowerConnectionError("offline")),
+        failures=(LuxPowerReadTimeoutError("synthetic"), None, None),
+        connect_failures=(
+            None,
+            LuxPowerConnectionError("transiently offline"),
+            None,
+        ),
     )
     client = LuxPowerHybridReadClient(
         "192.0.2.1", "TESTDONGLE", "TESTINV001",
         profile=profile, session=failed_connect, recovery_policy=recovery_policy(),
     )
     await client.async_connect()
+    await client.async_refresh_profile()
+    metrics = client.recovery_metrics()
+    assert failed_connect.connect_calls == 3
+    assert metrics.reconnect_attempts == 1
+    assert metrics.successful_reconnects == 1
+    assert metrics.failed_reconnects == 0
+    assert metrics.connection_establishment_failure_count == 1
+    assert metrics.connection_dial_attempts == 2
+    assert metrics.failed_connection_dial_attempts == 1
+    assert metrics.acquisitions_abandoned == 0
+    assert metrics.events[0].connection_dial_attempts == 2
+    assert metrics.events[0].failed_connection_dial_attempts == 1
+    assert metrics.events[0].outcome == "profile_recovered"
+
+
+@pytest.mark.asyncio
+async def test_exhausted_connection_attempts_abandon_one_recovery_episode():
+    profile = standard_profile()
+    failed_connect = RecoverySession(
+        profile,
+        failures=(LuxPowerReadTimeoutError("synthetic"),),
+        connect_failures=(
+            None,
+            LuxPowerConnectionError("offline one"),
+            LuxPowerConnectionError("offline two"),
+            LuxPowerConnectionError("offline three"),
+        ),
+    )
+    client = LuxPowerHybridReadClient(
+        "192.0.2.1", "TESTDONGLE", "TESTINV001",
+        profile=profile, session=failed_connect, recovery_policy=recovery_policy(),
+    )
+    await client.async_connect()
+
     with pytest.raises(LuxPowerConnectionError):
         await client.async_refresh_profile()
-    assert client.recovery_metrics().failed_reconnects == 1
+
+    metrics = client.recovery_metrics()
+    assert failed_connect.connect_calls == 4
+    assert metrics.reconnect_attempts == 1
+    assert metrics.successful_reconnects == 0
+    assert metrics.failed_reconnects == 1
+    assert metrics.connection_establishment_failure_count == 3
+    assert metrics.connection_dial_attempts == 3
+    assert metrics.failed_connection_dial_attempts == 3
+    assert metrics.acquisitions_abandoned == 1
+    assert metrics.retry_budget_exhausted == 0
+    assert metrics.connection_generations_created == 2
+    assert metrics.events[0].outcome == "connection_attempts_exhausted"
+
+
+@pytest.mark.asyncio
+async def test_modbus_rejection_is_not_blindly_retried():
+    profile = standard_profile()
 
     rejected = RecoverySession(
         profile, failures=(LuxPowerReadRejectedError("exception 3"),)
@@ -789,6 +939,7 @@ async def test_failed_reconnect_and_modbus_rejection_are_not_blindly_retried():
     with pytest.raises(LuxPowerReadRejectedError):
         await rejected_client.async_refresh_profile()
     assert rejected_client.recovery_metrics().reconnect_attempts == 0
+    assert rejected_client.recovery_metrics().connection_dial_attempts == 0
 
 
 @pytest.mark.asyncio

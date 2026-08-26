@@ -139,6 +139,8 @@ class _ActiveRecovery:
     connection_established_at: str | None = None
     failure_to_connection_seconds: float | None = None
     maximum_profile_age_seconds: float | None = None
+    connection_dial_attempts: int = 0
+    failed_connection_dial_attempts: int = 0
 
 
 class LuxPowerHybridReadClient:
@@ -206,6 +208,8 @@ class LuxPowerHybridReadClient:
         self._completed_recoveries = 0
         self._retry_budget_exhausted = 0
         self._acquisitions_abandoned = 0
+        self._connection_dial_attempts = 0
+        self._failed_connection_dial_attempts = 0
 
     async def async_connect(self) -> None:
         self._shutdown.clear()
@@ -321,6 +325,10 @@ class LuxPowerHybridReadClient:
             retry_budget_exhausted=self._retry_budget_exhausted,
             acquisitions_abandoned=self._acquisitions_abandoned,
             connection_generations_created=self._session.metrics().connections,
+            connection_dial_attempts=self._connection_dial_attempts,
+            failed_connection_dial_attempts=(
+                self._failed_connection_dial_attempts
+            ),
             events=tuple(self._recovery_events),
         )
 
@@ -595,28 +603,59 @@ class LuxPowerHybridReadClient:
             self._active_recovery = None
             raise LuxPowerSessionClosedError("recovery stopped by session shutdown")
         active.reconnect_started_at = utc_now().isoformat()
-        try:
-            await self._session.async_connect()
-        except asyncio.CancelledError:
-            self._health = AcquisitionHealth.DEGRADED
-            self._record_recovery(
-                active,
-                reconnect_succeeded=False,
-                outcome="cancelled",
-            )
-            self._active_recovery = None
-            raise
-        except LuxPowerConnectionError:
-            self._connection_establishment_failure_count += 1
-            self._failed_reconnects += 1
-            self._health = AcquisitionHealth.DEGRADED
-            self._record_recovery(
-                active,
-                reconnect_succeeded=False,
-                outcome="connection_failed",
-            )
-            self._active_recovery = None
-            raise
+        for attempt in range(policy.max_connection_attempts_per_reconnect):
+            active.connection_dial_attempts += 1
+            self._connection_dial_attempts += 1
+            try:
+                await self._session.async_connect()
+                break
+            except asyncio.CancelledError:
+                self._health = AcquisitionHealth.DEGRADED
+                self._record_recovery(
+                    active,
+                    reconnect_succeeded=False,
+                    outcome="cancelled",
+                )
+                self._active_recovery = None
+                raise
+            except LuxPowerConnectionError:
+                self._connection_establishment_failure_count += 1
+                self._failed_connection_dial_attempts += 1
+                active.failed_connection_dial_attempts += 1
+                if attempt + 1 >= policy.max_connection_attempts_per_reconnect:
+                    self._failed_reconnects += 1
+                    self._acquisitions_abandoned += 1
+                    self._health = AcquisitionHealth.DEGRADED
+                    self._record_recovery(
+                        active,
+                        reconnect_succeeded=False,
+                        outcome="connection_attempts_exhausted",
+                    )
+                    self._active_recovery = None
+                    raise
+                try:
+                    stopped = await self._shutdown_during(
+                        policy.repeated_cooldown_seconds
+                    )
+                except asyncio.CancelledError:
+                    self._health = AcquisitionHealth.DEGRADED
+                    self._record_recovery(
+                        active,
+                        reconnect_succeeded=False,
+                        outcome="cancelled",
+                    )
+                    self._active_recovery = None
+                    raise
+                if stopped:
+                    self._record_recovery(
+                        active,
+                        reconnect_succeeded=False,
+                        outcome="shutdown",
+                    )
+                    self._active_recovery = None
+                    raise LuxPowerSessionClosedError(
+                        "recovery stopped by session shutdown"
+                    )
         if self._shutdown.is_set():
             await self._session.async_close()
             self._record_recovery(
@@ -704,6 +743,10 @@ class LuxPowerHybridReadClient:
                     round(maximum_age, 6) if maximum_age is not None else None
                 ),
                 outcome=outcome,
+                connection_dial_attempts=active.connection_dial_attempts,
+                failed_connection_dial_attempts=(
+                    active.failed_connection_dial_attempts
+                ),
             )
         )
 
