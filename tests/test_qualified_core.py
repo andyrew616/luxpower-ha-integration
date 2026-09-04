@@ -13,6 +13,7 @@ from custom_components.lxp_modbus.classes.read_session import (
     LuxReadSessionMetrics,
     LuxReadSessionSnapshot,
 )
+from custom_components.lxp_modbus.constants import input_registers as reg
 from custom_components.lxp_modbus.exceptions import LuxPowerConnectionError
 from custom_components.lxp_modbus.observation import LuxPowerObservationTimes, utc_now
 from custom_components.lxp_modbus.recovery import AcquisitionHealth, RecoveryMetrics
@@ -31,6 +32,8 @@ EXPECTED_PUBLIC_NAMES = {
     "AcquisitionHealth",
     "EnergyFlowReadProfile",
     "EnergyFlowSnapshot",
+    "DirectEnergyTelemetrySnapshot",
+    "DIRECT_ENERGY_TELEMETRY_DEFINITION_VERSION",
     "GridTopology",
     "HybridProfileMetrics",
     "LoadLayout",
@@ -42,6 +45,7 @@ EXPECTED_PUBLIC_NAMES = {
     "LuxReadSessionMetrics",
     "ObservedProfileValue",
     "ProfileField",
+    "ProfileValueQuality",
     "QualifiedLuxReadClient",
     "QualifiedLuxSnapshot",
     "RecoveryMetrics",
@@ -111,6 +115,7 @@ class FakeDelegate:
     connect_gate = None
     refresh_gate = None
     close_gate = None
+    observed_at = None
 
     def __init__(self, *args, profile, session, **kwargs):
         self.args = args
@@ -137,20 +142,29 @@ class FakeDelegate:
         self.acquisition_health = AcquisitionHealth.HEALTHY
 
     def profile_snapshot(self):
-        observed_at = utc_now()
+        observed_at = self.observed_at or utc_now()
         values = {register: 0 for register in self.profile.required_registers}
-        times = {
-            register: observed_at for register in self.profile.required_registers
-        }
+        values.update(
+            {
+                reg.I_PINV: 1200,
+                reg.I_PREC: 300,
+                reg.I_PTOGRID: 700,
+                reg.I_PTOUSER: 100,
+                reg.I_SOC_SOH: 0x632A,
+            }
+        )
+        times = {register: observed_at for register in values}
         sources = {
-            register: LuxObservationSource.EXPLICIT
-            for register in self.profile.required_registers
+            register: LuxObservationSource.EXPLICIT for register in values
         }
+        sequences = {register: 1 for register in values}
         return self.profile.snapshot(
             LuxReadSessionSnapshot(
                 input_registers=values,
                 observed_at=LuxPowerObservationTimes(input_registers=times),
                 input_sources=sources,
+                input_observation_sequences=sequences,
+                input_observation_ranges={register: (0, 40) for register in values},
                 explicit_observed_at=times,
             )
         )
@@ -178,6 +192,7 @@ def fake_boundary(monkeypatch):
     FakeDelegate.connect_gate = None
     FakeDelegate.refresh_gate = None
     FakeDelegate.close_gate = None
+    FakeDelegate.observed_at = None
     monkeypatch.setattr(qualified, "_LuxReadSession", FakeSession)
     monkeypatch.setattr(qualified, "_LuxPowerHybridReadClient", FakeDelegate)
     return FakeDelegate
@@ -289,11 +304,17 @@ async def test_facade_uses_qualified_settings_and_delegates_lifecycle_once(fake_
 
     assert delegate.connect_calls == 1
     assert delegate.refresh_calls == 1
-    assert snapshot.api_version == 1
+    assert snapshot.api_version == 2
+    assert snapshot.direct_energy_definition_version == 1
     assert snapshot.profile.observed_at is not None
     assert snapshot.fresh is True
     assert snapshot.acquisition_health is AcquisitionHealth.HEALTHY
     assert snapshot.field_definitions == client.profile.fields
+    assert snapshot.direct_energy_field_definitions == client.profile.direct_energy_fields
+    assert snapshot.profile.direct_energy.pinv_w.value == 1200
+    assert snapshot.profile.direct_energy.prec_w.value == 300
+    assert snapshot.profile.direct_energy.grid_signed_power_w.value == 600
+    assert snapshot.profile.direct_energy.soc_percent.value == 42
     assert client.transport_metrics() == empty_transport_metrics()
     assert client.recovery_metrics().health is AcquisitionHealth.HEALTHY
 
@@ -302,6 +323,41 @@ async def test_facade_uses_qualified_settings_and_delegates_lifecycle_once(fake_
     assert delegate.close_calls == 1
     with pytest.raises(LuxPowerSessionClosedError):
         client.snapshot()
+
+
+@pytest.mark.asyncio
+async def test_supported_snapshot_fails_stale_direct_fields_closed(
+    fake_boundary,
+    monkeypatch,
+):
+    observed_at = utc_now()
+    FakeDelegate.observed_at = observed_at
+    monkeypatch.setattr(
+        qualified,
+        "utc_now",
+        lambda: (
+            observed_at
+            + qualified.QUALIFIED_FRESHNESS_TARGET
+            + qualified.timedelta(microseconds=1)
+        ),
+    )
+    client = new_client()
+    await client.async_start()
+
+    snapshot = client.snapshot()
+
+    assert snapshot.fresh is False
+    assert all(
+        field.value is None
+        and field.quality is qualified.ProfileValueQuality.STALE
+        for field in (
+            snapshot.profile.direct_energy.pinv_w,
+            snapshot.profile.direct_energy.prec_w,
+            snapshot.profile.direct_energy.grid_signed_power_w,
+            snapshot.profile.direct_energy.soc_percent,
+        )
+    )
+    await client.async_close()
 
 
 @pytest.mark.asyncio

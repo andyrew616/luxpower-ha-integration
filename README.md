@@ -105,6 +105,13 @@ start, freshness-driven profile acquisition, typed snapshots, health/metrics,
 and close behavior. Arbitrary FC4 ranges, scans, writes, and qualification phase
 controls are intentionally absent.
 
+The supported snapshot includes a per-device direct-energy contract for raw
+`Pinv`, raw `Prec`, export-positive signed grid flow, and validated SOC. It does
+not claim AC solar, battery-only AC power, site SOC, or multi-inverter totals;
+those semantics require separate live/topology qualification.
+See [Direct energy telemetry semantic qualification](docs/direct-energy-telemetry.md)
+for the exact register and electrical-boundary decisions.
+
 The installable artifact retains the repository's legacy Home Assistant path
 for compatibility, but importing the qualified boundary does not load it.
 

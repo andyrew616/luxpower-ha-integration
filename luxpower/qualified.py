@@ -9,7 +9,7 @@ must not depend on that alias or on low-level session APIs.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 
 from custom_components.lxp_modbus.classes.read_session import (
@@ -25,13 +25,16 @@ from custom_components.lxp_modbus.exceptions import (
 )
 from custom_components.lxp_modbus.observation import utc_now
 from custom_components.lxp_modbus.read_profiles import (
+    DIRECT_ENERGY_TELEMETRY_DEFINITION_VERSION,
     ENERGY_FLOW_PROFILE_DEFINITION_VERSION,
+    DirectEnergyTelemetrySnapshot,
     EnergyFlowReadProfile,
     EnergyFlowSnapshot,
     GridTopology,
     LoadLayout,
     ObservedProfileValue,
     ProfileField,
+    ProfileValueQuality,
     profile_block_details,
 )
 from custom_components.lxp_modbus.recovery import (
@@ -44,7 +47,7 @@ from luxpower.hybrid import (
     LuxPowerHybridReadClient as _LuxPowerHybridReadClient,
 )
 
-QUALIFIED_CORE_API_VERSION = 1
+QUALIFIED_CORE_API_VERSION = 2
 QUALIFIED_FRESHNESS_TARGET = timedelta(seconds=20)
 QUALIFIED_DRAIN_TIMEOUT_SECONDS = 3.0
 QUALIFIED_REPLY_TIMEOUT_SECONDS = 10.0
@@ -60,8 +63,10 @@ class QualifiedLuxSnapshot:
     """One detached profile view and its truthful inspection-time health."""
 
     api_version: int
+    direct_energy_definition_version: int
     profile: EnergyFlowSnapshot
     field_definitions: tuple[ProfileField, ...]
+    direct_energy_field_definitions: tuple[ProfileField, ...]
     acquisition_health: AcquisitionHealth
     freshness_target: timedelta
     inspected_at: datetime
@@ -163,6 +168,13 @@ class QualifiedLuxReadClient:
         self._require_started()
         profile_snapshot = self._delegate.profile_snapshot()
         inspected_at = utc_now()
+        profile_snapshot = replace(
+            profile_snapshot,
+            direct_energy=profile_snapshot.direct_energy.unavailable_if_stale(
+                inspected_at=inspected_at,
+                freshness_target=self._freshness_target,
+            ),
+        )
         observed_at = profile_snapshot.observed_at
         fresh = (
             observed_at is not None
@@ -170,8 +182,10 @@ class QualifiedLuxReadClient:
         )
         return QualifiedLuxSnapshot(
             api_version=QUALIFIED_CORE_API_VERSION,
+            direct_energy_definition_version=DIRECT_ENERGY_TELEMETRY_DEFINITION_VERSION,
             profile=profile_snapshot,
             field_definitions=self._profile.fields,
+            direct_energy_field_definitions=self._profile.direct_energy_fields,
             acquisition_health=self._delegate.acquisition_health,
             freshness_target=self._freshness_target,
             inspected_at=inspected_at,
@@ -218,6 +232,8 @@ __all__ = [
     "AcquisitionHealth",
     "EnergyFlowReadProfile",
     "EnergyFlowSnapshot",
+    "DirectEnergyTelemetrySnapshot",
+    "DIRECT_ENERGY_TELEMETRY_DEFINITION_VERSION",
     "GridTopology",
     "HybridProfileMetrics",
     "LoadLayout",
@@ -229,6 +245,7 @@ __all__ = [
     "LuxReadSessionMetrics",
     "ObservedProfileValue",
     "ProfileField",
+    "ProfileValueQuality",
     "QualifiedLuxReadClient",
     "QualifiedLuxSnapshot",
     "RecoveryMetrics",

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "luxpower-qualified-read-core"
-version = "0.1.0"
+version = "0.2.0"
 description = "Supported read-only product boundary for the qualified LuxPower FC4 core"
 readme = "docs/qualified-read-core.md"
 requires-python = ">=3.13"

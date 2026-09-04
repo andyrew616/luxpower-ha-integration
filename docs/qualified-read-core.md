@@ -68,6 +68,20 @@ configured freshness target, an inspection time, and a derived freshness flag.
 It does not invent an inverter timestamp or expose a transport generation as a
 cross-device coherence claim.
 
+API version 2 adds `profile.direct_energy`, a versioned, per-device semantic
+contract for `pinv_w`, `prec_w`, export-positive `grid_signed_power_w`, and
+validated `soc_percent`. These values come from the existing accepted 0–39
+response and fail closed for missing provenance, `0xFFFF`, invalid SOC,
+incoherent derived inputs, or staleness at inspection time. Accepted-response
+sequence and range are retained only to prove 0–39 response ownership within one client;
+it is not an inverter timestamp or a cross-device synchronisation claim.
+
+The contract intentionally has no AC solar, AC battery, site SOC, or two-device
+aggregate. PV registers are DC/MPPT-side. `Pinv` and `Prec` describe the whole
+hybrid inverter AC boundary; their difference is not qualified as battery-only.
+The full audit and gate are recorded in
+[`direct-energy-telemetry.md`](direct-energy-telemetry.md).
+
 ## Packaging and dependencies
 
 The distribution requires Python 3.13 or newer, the version exercised by the
@@ -150,6 +164,11 @@ Repeat live qualification before production promotion when a revision changes:
   freshness rules;
 - runtime scheduling, service supervision, concurrency, or device topology;
 - any newly exposed field or semantic claim.
+
+The direct energy fields added after the live soak are offline-qualified only.
+Their register mapping, transforms, quality handling, and response provenance
+must be compared with live Home Assistant/device evidence before any production
+source-authority promotion.
 
 Packaging or documentation-only changes still require isolated import/install
 checks and the complete offline transport/profile regression suite. Diagnostic

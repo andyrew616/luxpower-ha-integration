@@ -205,6 +205,8 @@ class LuxReadSessionSnapshot:
         default_factory=LuxPowerObservationTimes,
     )
     input_sources: Mapping[int, LuxObservationSource] = field(default_factory=dict)
+    input_observation_sequences: Mapping[int, int] = field(default_factory=dict)
+    input_observation_ranges: Mapping[int, tuple[int, int]] = field(default_factory=dict)
     explicit_observed_at: Mapping[int, datetime] = field(default_factory=dict)
     unsolicited_observed_at: Mapping[int, datetime] = field(default_factory=dict)
 
@@ -366,6 +368,8 @@ class LuxReadSession:
         self._input_registers: dict[int, int] = {}
         self._input_observed_at: dict[int, datetime] = {}
         self._input_sources: dict[int, LuxObservationSource] = {}
+        self._input_observation_sequences: dict[int, int] = {}
+        self._input_observation_ranges: dict[int, tuple[int, int]] = {}
         self._explicit_observed_at: dict[int, datetime] = {}
         self._unsolicited_observed_at: dict[int, datetime] = {}
         self._last_block_values: dict[tuple[int, int], dict[int, int]] = {}
@@ -823,6 +827,8 @@ class LuxReadSession:
                 input_registers=dict(self._input_observed_at)
             ),
             input_sources=dict(self._input_sources),
+            input_observation_sequences=dict(self._input_observation_sequences),
+            input_observation_ranges=dict(self._input_observation_ranges),
             explicit_observed_at=dict(self._explicit_observed_at),
             unsolicited_observed_at=dict(self._unsolicited_observed_at),
         )
@@ -1127,6 +1133,12 @@ class LuxReadSession:
             self._duplicate_fc4_frames += 1
 
         self._observation_sequence += 1
+        self._input_observation_sequences.update(
+            {register: self._observation_sequence for register in values}
+        )
+        self._input_observation_ranges.update(
+            {register: (response.register, count) for register in values}
+        )
         observation = LuxReadObservation(
             register_start=response.register,
             register_count=count,

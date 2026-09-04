@@ -223,6 +223,14 @@ async def test_exact_response_and_unmatched_fc4_are_routed_independently():
     assert session.metrics().expected_fc4_responses == 1
     assert session.snapshot().input_sources[0] is LuxObservationSource.UNSOLICITED
     assert session.snapshot().input_sources[160] is LuxObservationSource.EXPLICIT
+    assert session.snapshot().input_observation_sequences[0] == first.sequence
+    assert session.snapshot().input_observation_sequences[160] == second.sequence
+    assert session.snapshot().input_observation_ranges[0] == (0, 40)
+    assert session.snapshot().input_observation_ranges[160] == (160, 40)
+    assert first.sequence != second.sequence
+    detached_sequences = session.snapshot().input_observation_sequences
+    detached_sequences[0] = 999
+    assert session.snapshot().input_observation_sequences[0] == first.sequence
     detached_sources = session.snapshot().input_sources
     detached_sources[0] = LuxObservationSource.EXPLICIT
     assert session.snapshot().input_sources[0] is LuxObservationSource.UNSOLICITED

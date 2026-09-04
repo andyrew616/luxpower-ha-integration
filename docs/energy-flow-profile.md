@@ -11,7 +11,7 @@ required at high cadence.
 |---|---:|---:|---|---|
 | Inverter state | 0 | raw enum | direct | Inverter State |
 | Battery SOC | 5 | low byte, 1% | direct packed value | Battery SOC |
-| PV power | 7–9 and optionally 220–222 | 1 W | sum only explicitly configured active strings | PV Power |
+| PV input power | 7–9 and optionally 220–222 | 1 W | sum only explicitly configured active strings; DC/MPPT-side, not solar AC | PV Power |
 | Battery charge | 10 | 1 W | direct | Battery Charge Power |
 | Battery discharge | 11 | 1 W | direct | Battery Discharge Power |
 | Signed battery power | 10, 11 | 1 W | discharge minus charge; positive is discharge | Battery Flow |
@@ -31,6 +31,32 @@ inputs actually used. The overall profile `observed_at` is the oldest time among
 all required profile registers. Incidental values received in an aligned block
 are cached truthfully but cannot improve profile completeness or freshness.
 
+## Direct energy telemetry contract
+
+The supported qualified snapshot also exposes a narrow per-device contract for
+values already present incidentally in the accepted 0–39 FC4 response:
+
+| Field | Register authority | Rule | Direction/boundary |
+|---|---:|---|---|
+| `pinv_w` | 16 | direct, 1 W | whole-inverter on-grid AC output |
+| `prec_w` | 17 | direct, 1 W | whole-inverter AC charging/rectification input |
+| `grid_signed_power_w` | 26, 27 | `PTOGRID - PTOUSER` | positive export, negative import |
+| `soc_percent` | 5 | packed low byte, 0–100% | per-device only; no site authority claim |
+
+These values carry accepted-response sequence/range, local acceptance timestamps,
+source classification, and semantic quality. Derived grid flow is unavailable
+unless both inputs came from the same accepted 0–39 response. `0xFFFF`, invalid SOC,
+missing provenance, and stale data remain unavailable rather than becoming zero.
+The response sequence is local to one client and does not imply simultaneous
+inverter sampling or cross-device coherence.
+
+`Pinv` includes the whole hybrid inverter's on-grid output and is not proven to
+be solar-only or battery-only. Consequently the contract deliberately exposes
+neither `battery_ac_signed_power_w` nor `solar_ac_power_w`. `Prec - Pinv` is an
+inverter AC-boundary flow, not a qualified battery-only flow. The existing PV
+register sum is DC/MPPT-side and is unsuitable for an AC household-balance solar
+slot without further evidence.
+
 ## Hardware-aligned plan
 
 For a standard inverter with PV1–PV3, the minimum proven aligned 40-register
@@ -40,6 +66,10 @@ plan is:
 |---|---|---:|---:|
 | 0–39 | 0, 5, 7, 8, 9, 10, 11, 24, 26, 27 | 30 | 117 bytes |
 | 160–199 | 170 | 39 | 117 bytes |
+
+Adding the direct telemetry contract does not add required registers, blocks,
+requests, or scheduling decisions. Registers 16 and 17 remain incidental values
+inside the already-required 0–39 response.
 
 For the measured 12K single-phase layout, the same critical fields instead use
 blocks 0–39 and 80–119; register 114 replaces register 170 as the direct on-grid
