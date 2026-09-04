@@ -34,12 +34,18 @@ from custom_components.lxp_modbus.exceptions import (
     LuxPowerRecoveryExhaustedError,
     LuxPowerSessionClosedError,
 )
-from custom_components.lxp_modbus.recovery import AcquisitionHealth, RecoveryPolicy
+from custom_components.lxp_modbus.recovery import (
+    AcquisitionHealth,
+    RecoveryFailureKind,
+    RecoveryPolicy,
+)
 from custom_components.lxp_modbus.timeout_diagnostics import LuxReadPurpose
 from luxpower.hybrid import (
     FULL_INPUT_READ_BLOCKS,
     OPERATIONAL_READ_BLOCKS,
+    RECOVERY_EVENT_CAPACITY,
     LuxPowerHybridReadClient,
+    _ActiveRecovery,
     execute_live_validation,
 )
 
@@ -520,6 +526,38 @@ def test_recovery_policy_requires_positive_connection_attempt_limit():
         ValueError, match="max_connection_attempts_per_reconnect cannot exceed 5"
     ):
         recovery_policy(max_connection_attempts_per_reconnect=6)
+
+
+def test_recovery_event_retention_rolls_over_without_changing_totals():
+    client = LuxPowerHybridReadClient(
+        "192.0.2.1", "TESTDONGLE", "TESTINV001", profile=standard_profile()
+    )
+
+    for index in range(RECOVERY_EVENT_CAPACITY + 3):
+        client._record_recovery(
+            _ActiveRecovery(
+                failure_kind=RecoveryFailureKind.REQUEST_TIMEOUT,
+                block=client.profile.read_blocks[0],
+                started_monotonic=client._monotonic(),
+                episode_started_at=f"episode-{index}",
+                recovery_started_at=f"recovery-{index}",
+                cooldown_seconds=1,
+            ),
+            reconnect_succeeded=False,
+            outcome="synthetic",
+        )
+
+    metrics = client.recovery_metrics()
+    assert metrics.recovery_event_capacity == RECOVERY_EVENT_CAPACITY
+    assert metrics.recovery_events_recorded == RECOVERY_EVENT_CAPACITY + 3
+    assert metrics.recovery_events_dropped == 3
+    assert len(metrics.events) == RECOVERY_EVENT_CAPACITY
+    assert metrics.events[0].episode_started_at == "episode-3"
+    assert metrics.events[-1].episode_started_at == (
+        f"episode-{RECOVERY_EVENT_CAPACITY + 2}"
+    )
+    assert metrics.reconnect_attempts == 0
+    assert metrics.retry_budget_exhausted == 0
 
 
 @pytest.mark.asyncio

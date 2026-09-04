@@ -101,3 +101,6 @@ class RecoveryMetrics:
     connection_dial_attempts: int = 0
     failed_connection_dial_attempts: int = 0
     events: tuple[RecoveryEvent, ...] = field(default_factory=tuple)
+    recovery_event_capacity: int = 0
+    recovery_events_recorded: int = 0
+    recovery_events_dropped: int = 0

@@ -20,16 +20,17 @@ from typing import Mapping, Sequence
 
 from custom_components.lxp_modbus.classes.read_session import LuxReadSession
 from custom_components.lxp_modbus.const import READ_TIMEOUT
-from custom_components.lxp_modbus.exceptions import LuxPowerCommunicationError
 from custom_components.lxp_modbus.observation import utc_now
-from custom_components.lxp_modbus.read_profiles import (
+from luxpower.qualified import (
     ENERGY_FLOW_PROFILE_DEFINITION_VERSION,
     EnergyFlowReadProfile,
     GridTopology,
     LoadLayout,
+    LuxPowerCommunicationError,
+    RecoveryPolicy,
+    _QualificationLuxReadClient as LuxPowerHybridReadClient,
     profile_block_details,
 )
-from custom_components.lxp_modbus.recovery import RecoveryPolicy
 from custom_components.lxp_modbus.timeout_diagnostics import (
     LuxReadDiagnosticJournal,
     LuxReadDiagnosticsSnapshot,
@@ -37,14 +38,10 @@ from custom_components.lxp_modbus.timeout_diagnostics import (
     LuxReadRequestDiagnostic,
     LuxReadRequestOutcome,
 )
-from luxpower.hybrid import (
-    LuxPowerHybridReadClient,
-    _latency_summary,
-    _metrics_delta,
-)
+from luxpower.hybrid import _latency_summary, _metrics_delta
 
-PROFILE_VALIDATION_SCHEMA_VERSION = 8
-PROFILE_VALIDATION_VERSION = "8.0"
+PROFILE_VALIDATION_SCHEMA_VERSION = 9
+PROFILE_VALIDATION_VERSION = "9.0"
 PROFILE_FRESHNESS_QUANTILE_CAPACITY = 16_384
 PROFILE_VIOLATION_EPISODE_CAPACITY = 4_096
 PROFILE_FRESHNESS_RESERVOIR_SEED = 0
@@ -709,9 +706,21 @@ def _recovery_metrics_delta(before, after) -> dict:
         "failed_connection_dial_attempts",
     )
     result = {name: getattr(after, name) - getattr(before, name) for name in fields}
-    result["events"] = [
-        asdict(event) for event in after.events[len(before.events):]
-    ]
+    events_recorded = (
+        after.recovery_events_recorded - before.recovery_events_recorded
+    )
+    retained = min(max(events_recorded, 0), len(after.events))
+    unretained = max(events_recorded - retained, 0)
+    new_events = after.events[-retained:] if retained else ()
+    result["events"] = [asdict(event) for event in new_events]
+    result["event_retention"] = {
+        "capacity": after.recovery_event_capacity,
+        "recorded": events_recorded,
+        "retained": retained,
+        "unretained": unretained,
+        "history_complete": unretained == 0,
+        "lifetime_dropped": after.recovery_events_dropped,
+    }
     result["final_health"] = after.health.value
     return result
 
@@ -954,9 +963,9 @@ def aggregate_qualification_reports(
     """Aggregate sanitized sustained phases without inferring long-term rates."""
     phases: list[tuple[Mapping[str, object], Mapping[str, object]]] = []
     for report in reports:
-        if int(report.get("schema_version", 0)) not in (3, 4, 5, 6, 7, 8):
+        if int(report.get("schema_version", 0)) not in (3, 4, 5, 6, 7, 8, 9):
             raise ValueError(
-                "qualification aggregation requires schema-v3 through v8 reports"
+                "qualification aggregation requires schema-v3 through v9 reports"
             )
         phases.extend(
             (report, phase)
@@ -987,7 +996,7 @@ def aggregate_qualification_reports(
             "reply_timeout_seconds",
             "split_request_deadlines",
         ]
-        if report_schemas in ({6}, {7}, {8}):
+        if report_schemas in ({6}, {7}, {8}, {9}):
             provenance_keys.extend(
                 (
                     "tcp_keepalive_enabled",
@@ -1006,7 +1015,7 @@ def aggregate_qualification_reports(
                     raise ValueError(
                         "schema-v6+ qualification is missing required provenance"
                     )
-        if report_schemas == {8}:
+        if report_schemas in ({8}, {9}):
             for report in provenance_reports:
                 provenance = report.get("provenance")
                 aggregation = (
@@ -1028,7 +1037,7 @@ def aggregate_qualification_reports(
                     or not required_aggregation_fields <= set(aggregation)
                 ):
                     raise ValueError(
-                        "schema-v8 qualification is missing freshness aggregation provenance"
+                        "schema-v8+ qualification is missing freshness aggregation provenance"
                     )
         provenance_sets = {
             tuple(report["provenance"][key] for key in provenance_keys)
@@ -1099,6 +1108,23 @@ def aggregate_qualification_reports(
             raise ValueError(
                 "schema-v6 qualification is missing required liveness metrics"
             )
+        if int(report["schema_version"]) >= 9:
+            retention = phase.get("recovery_metrics", {}).get("event_retention")
+            required_retention_fields = {
+                "capacity",
+                "recorded",
+                "retained",
+                "unretained",
+                "history_complete",
+                "lifetime_dropped",
+            }
+            if (
+                not isinstance(retention, Mapping)
+                or not required_retention_fields <= set(retention)
+            ):
+                raise ValueError(
+                    "schema-v9 qualification is missing recovery-event retention"
+                )
     session_totals = {
         field: sum(int(phase["session_metrics"][field]) for _, phase in phases)
         for field in established_session_fields
@@ -1130,6 +1156,32 @@ def aggregate_qualification_reports(
         )
         for field in recovery_fields
     }
+    recovery_event_retention = (
+        {
+            "recorded": sum(
+                int(phase["recovery_metrics"]["event_retention"]["recorded"])
+                for _, phase in phases
+            ),
+            "retained": sum(
+                int(phase["recovery_metrics"]["event_retention"]["retained"])
+                for _, phase in phases
+            ),
+            "unretained": sum(
+                int(phase["recovery_metrics"]["event_retention"]["unretained"])
+                for _, phase in phases
+            ),
+            "history_complete": all(
+                bool(
+                    phase["recovery_metrics"]["event_retention"][
+                        "history_complete"
+                    ]
+                )
+                for _, phase in phases
+            ),
+        }
+        if report_schemas == {9}
+        else None
+    )
     latency_values = [
         float(value)
         for _, phase in phases
@@ -1199,7 +1251,11 @@ def aggregate_qualification_reports(
     )
     return {
         "schema_version": (
-            4 if report_schemas == {8} else 3 if report_schemas == {7} else 2
+            4
+            if report_schemas in ({8}, {9})
+            else 3
+            if report_schemas == {7}
+            else 2
         ),
         "source_report_schema_version": (
             next(iter({int(report["schema_version"]) for report, _ in phases}))
@@ -1236,7 +1292,7 @@ def aggregate_qualification_reports(
                     "provenance"
                 ].get("receive_inactivity_timeout_seconds"),
             }
-            if report_schemas in ({6}, {7}, {8})
+            if report_schemas in ({6}, {7}, {8}, {9})
             else None
         ),
         "sustained_runs": len(phases),
@@ -1252,6 +1308,7 @@ def aggregate_qualification_reports(
             )
         ),
         "recovery_totals": recovery_totals,
+        "recovery_event_retention": recovery_event_retention,
         "health_state_duration_seconds": health_state_duration_seconds,
         "observation_delivery_complete": bool(
             session_totals["observation_queue_drops"] == 0
@@ -1345,6 +1402,7 @@ async def _run_profile_phase(
     recovery_safe = bool(
         not error
         and not unsafe_events
+        and recovery_delta["event_retention"]["history_complete"]
         and recovery_delta["failed_reconnects"] == 0
         and recovery_delta["retry_budget_exhausted"] == 0
         and all(

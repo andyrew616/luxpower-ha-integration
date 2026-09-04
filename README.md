@@ -96,6 +96,22 @@ The API does not currently expose calculated values. A future calculated value
 that depends on multiple registers must not claim freshness newer than its oldest
 required input. The standalone facade intentionally provides no write operation.
 
+### Qualified FC4 product boundary
+
+Long-running read-only consumers should use the narrow, installable
+`luxpower.qualified` API rather than importing the experimental hybrid or
+qualification modules directly. It owns no permanent scheduler and exposes only
+start, freshness-driven profile acquisition, typed snapshots, health/metrics,
+and close behavior. Arbitrary FC4 ranges, scans, writes, and qualification phase
+controls are intentionally absent.
+
+The installable artifact retains the repository's legacy Home Assistant path
+for compatibility, but importing the qualified boundary does not load it.
+
+See [Qualified Lux FC4 read core](docs/qualified-read-core.md) for the supported
+imports, lifecycle, packaging, qualification lineage, and requalification
+rules.
+
 Contributors can measure real dongle timing with the separate, strictly read-only
 [hardware benchmark](docs/hardware-benchmark.md). The benchmark does not alter the
 integration polling path or expose inverter writes.

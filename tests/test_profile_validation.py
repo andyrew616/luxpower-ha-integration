@@ -8,7 +8,7 @@ import subprocess
 import sys
 from types import SimpleNamespace
 from dataclasses import replace
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -20,6 +20,7 @@ from custom_components.lxp_modbus.read_profiles import (
 )
 from custom_components.lxp_modbus.recovery import (
     AcquisitionHealth,
+    RecoveryEvent,
     RecoveryFailureKind,
     RecoveryMetrics,
 )
@@ -37,6 +38,7 @@ from luxpower.profile_validation import (
     _load_private_target,
     _nearest_rank_p95,
     _nearest_rank_p99,
+    _recovery_metrics_delta,
     _time_beyond_target,
     _time_beyond_target_by_health_state,
     _time_beyond_target_by_recovery_episode,
@@ -52,6 +54,76 @@ from luxpower.profile_validation import (
     summarize_profile_samples,
 )
 from luxpower.hybrid import _latency_summary
+
+
+def _recovery_event(index: int) -> RecoveryEvent:
+    started_at = datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(
+        seconds=index
+    )
+    return RecoveryEvent(
+        failure_kind=RecoveryFailureKind.REQUEST_TIMEOUT,
+        episode_started_at=started_at.isoformat(),
+        ended_at=(started_at + timedelta(milliseconds=500)).isoformat(),
+        failed_register_start=0,
+        failed_register_count=40,
+        cooldown_seconds=1.0,
+        reconnect_succeeded=True,
+        failure_to_connection_seconds=0.1,
+        failure_to_profile_recovery_seconds=0.2,
+        maximum_profile_age_seconds=20.0,
+        outcome="profile_recovered",
+    )
+
+
+def test_recovery_delta_reports_truthful_totals_after_event_rollover():
+    before = RecoveryMetrics(
+        health=AcquisitionHealth.HEALTHY,
+        timeout_count=10,
+        connection_loss_count=0,
+        connection_establishment_failure_count=0,
+        ambiguous_request_count=0,
+        reconnect_attempts=10,
+        successful_reconnects=10,
+        failed_reconnects=0,
+        completed_recoveries=10,
+        retry_budget_exhausted=0,
+        acquisitions_abandoned=0,
+        connection_generations_created=11,
+        events=tuple(_recovery_event(index) for index in range(10)),
+        recovery_event_capacity=512,
+        recovery_events_recorded=10,
+    )
+    after = replace(
+        before,
+        timeout_count=610,
+        reconnect_attempts=610,
+        successful_reconnects=610,
+        completed_recoveries=610,
+        connection_generations_created=611,
+        events=tuple(_recovery_event(index) for index in range(98, 610)),
+        recovery_events_recorded=610,
+        recovery_events_dropped=98,
+    )
+
+    delta = _recovery_metrics_delta(before, after)
+
+    assert delta["timeout_count"] == 600
+    assert delta["completed_recoveries"] == 600
+    assert delta["event_retention"] == {
+        "capacity": 512,
+        "recorded": 600,
+        "retained": 512,
+        "unretained": 88,
+        "history_complete": False,
+        "lifetime_dropped": 98,
+    }
+    assert len(delta["events"]) == 512
+    assert delta["events"][0]["episode_started_at"] == _recovery_event(
+        98
+    ).episode_started_at
+    assert delta["events"][-1]["episode_started_at"] == _recovery_event(
+        609
+    ).episode_started_at
 
 
 def test_nearest_rank_statistics_and_profile_freshness_summary():
@@ -767,7 +839,10 @@ def test_schema_v7_aggregation_requires_matching_recovery_policy():
         aggregate_qualification_reports(reports)
 
 
-def test_schema_v8_aggregation_requires_matching_streaming_provenance():
+@pytest.mark.parametrize("source_schema", (8, 9))
+def test_schema_v8_plus_aggregation_requires_matching_streaming_provenance(
+    source_schema,
+):
     report = _qualification_report(
         timeout=0,
         reconnect=0,
@@ -775,7 +850,7 @@ def test_schema_v8_aggregation_requires_matching_streaming_provenance():
         maximum=8.0,
         values=[700.0] * 100,
     )
-    report["schema_version"] = 8
+    report["schema_version"] = source_schema
     report["phases"][0]["session_metrics"].update(
         {
             "tcp_keepalive_applied_connections": 1,
@@ -820,6 +895,15 @@ def test_schema_v8_aggregation_requires_matching_streaming_provenance():
         "repeated_cooldown_seconds": 5.0,
     }
     report["phases"][0]["freshness_evidence_complete"] = True
+    if source_schema >= 9:
+        report["phases"][0]["recovery_metrics"]["event_retention"] = {
+            "capacity": 512,
+            "recorded": 0,
+            "retained": 0,
+            "unretained": 0,
+            "history_complete": True,
+            "lifetime_dropped": 0,
+        }
     report["phases"][0]["violation_episodes"].update(
         {"ended_stale": False, "right_censored_episode_count": 0}
     )
@@ -828,9 +912,26 @@ def test_schema_v8_aggregation_requires_matching_streaming_provenance():
     aggregate = aggregate_qualification_reports(reports)
 
     assert aggregate["schema_version"] == 4
-    assert aggregate["source_report_schema_version"] == 8
+    assert aggregate["source_report_schema_version"] == source_schema
     assert aggregate["freshness"]["evidence_complete"] is True
     assert aggregate["freshness"]["episode_details_dropped"] == 0
+    assert aggregate["recovery_event_retention"] == (
+        {
+            "recorded": 0,
+            "retained": 0,
+            "unretained": 0,
+            "history_complete": True,
+        }
+        if source_schema >= 9
+        else None
+    )
+    if source_schema >= 9:
+        missing_retention = copy.deepcopy(reports)
+        del missing_retention[0]["phases"][0]["recovery_metrics"][
+            "event_retention"
+        ]
+        with pytest.raises(ValueError, match="missing recovery-event retention"):
+            aggregate_qualification_reports(missing_retention)
 
     reports[1]["phases"][0]["violation_episodes"].update(
         {
@@ -1019,6 +1120,93 @@ async def test_delivery_drop_is_separate_from_transport_recovery_safety():
 
 
 @pytest.mark.asyncio
+async def test_incomplete_recovery_event_history_fails_phase_qualification():
+    class RolledRecoveryClient:
+        def __init__(self):
+            self.recovery_snapshots = 0
+
+        def metrics(self):
+            return _zero_session_metrics()
+
+        def profile_metrics(self):
+            return HybridProfileMetrics(0, 0, 0)
+
+        def recovery_metrics(self):
+            self.recovery_snapshots += 1
+            if self.recovery_snapshots == 1:
+                return RecoveryMetrics(
+                    health=AcquisitionHealth.HEALTHY,
+                    timeout_count=0,
+                    connection_loss_count=0,
+                    connection_establishment_failure_count=0,
+                    ambiguous_request_count=0,
+                    reconnect_attempts=0,
+                    successful_reconnects=0,
+                    failed_reconnects=0,
+                    completed_recoveries=0,
+                    retry_budget_exhausted=0,
+                    acquisitions_abandoned=0,
+                    connection_generations_created=1,
+                    recovery_event_capacity=512,
+                )
+            return RecoveryMetrics(
+                health=AcquisitionHealth.HEALTHY,
+                timeout_count=513,
+                connection_loss_count=0,
+                connection_establishment_failure_count=0,
+                ambiguous_request_count=0,
+                reconnect_attempts=513,
+                successful_reconnects=513,
+                failed_reconnects=0,
+                completed_recoveries=513,
+                retry_budget_exhausted=0,
+                acquisitions_abandoned=0,
+                connection_generations_created=514,
+                events=tuple(_recovery_event(index) for index in range(1, 513)),
+                recovery_event_capacity=512,
+                recovery_events_recorded=513,
+                recovery_events_dropped=1,
+            )
+
+        async def async_run_profile(self, _duration, *, sample_sink):
+            now = utc_now()
+            for offset in (0.0, 0.1):
+                sample_sink.append(
+                    {
+                        "at": (now + timedelta(seconds=offset)).isoformat(),
+                        "acquisition_health": "healthy",
+                        "profile_freshness": {
+                            "known": 1,
+                            "required": 1,
+                            "median_age_seconds": 1.0,
+                            "max_age_seconds": 1.0,
+                            "max_age_seconds_raw": 1.0,
+                            "worst_register": 0,
+                        },
+                    }
+                )
+
+    phase = await _run_profile_phase(
+        RolledRecoveryClient(),
+        name="rolled_recovery_history",
+        target_seconds=20.0,
+        duration_seconds=0.1,
+    )
+
+    assert phase["recovery_metrics"]["event_retention"] == {
+        "capacity": 512,
+        "recorded": 513,
+        "retained": 512,
+        "unretained": 1,
+        "history_complete": False,
+        "lifetime_dropped": 1,
+    }
+    assert phase["freshness_target_met"] is True
+    assert phase["transport_recovery_safe"] is False
+    assert phase["target_met"] is False
+
+
+@pytest.mark.asyncio
 async def test_short_only_schema_v5_provenance_and_intentional_shutdown_health():
     class QualificationClient:
         def __init__(self):
@@ -1093,8 +1281,8 @@ async def test_short_only_schema_v5_provenance_and_intentional_shutdown_health()
         implementation_revision="a" * 40,
     )
 
-    assert report["schema_version"] == 8
-    assert report["validation_version"] == "8.0"
+    assert report["schema_version"] == 9
+    assert report["validation_version"] == "9.0"
     assert report["provenance"] == {
         "implementation_revision": "a" * 40,
         "revision_source": "operator_supplied",

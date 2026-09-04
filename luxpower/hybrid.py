@@ -61,6 +61,7 @@ from custom_components.lxp_modbus.timeout_diagnostics import (
 HYBRID_SCHEMA_VERSION = 1
 HYBRID_VERSION = "1.0"
 HARDWARE_READ_BLOCK_SIZE = 40
+RECOVERY_EVENT_CAPACITY = 512
 
 
 OPERATIONAL_READ_BLOCKS = tuple(
@@ -197,7 +198,10 @@ class LuxPowerHybridReadClient:
         self._shutdown.set()
         self._health = AcquisitionHealth.DEGRADED
         self._reconnect_attempt_times: deque[float] = deque()
-        self._recovery_events: list[RecoveryEvent] = []
+        self._recovery_events: deque[RecoveryEvent] = deque(
+            maxlen=RECOVERY_EVENT_CAPACITY
+        )
+        self._recovery_events_recorded = 0
         self._active_recovery: _ActiveRecovery | None = None
         self._timeout_count = 0
         self._connection_loss_count = 0
@@ -331,6 +335,11 @@ class LuxPowerHybridReadClient:
                 self._failed_connection_dial_attempts
             ),
             events=tuple(self._recovery_events),
+            recovery_event_capacity=RECOVERY_EVENT_CAPACITY,
+            recovery_events_recorded=self._recovery_events_recorded,
+            recovery_events_dropped=(
+                self._recovery_events_recorded - len(self._recovery_events)
+            ),
         )
 
     @property
@@ -758,6 +767,7 @@ class LuxPowerHybridReadClient:
                 ),
             )
         )
+        self._recovery_events_recorded += 1
 
     def _abandon_recovery(self, error: LuxPowerCommunicationError) -> None:
         self._health = AcquisitionHealth.DEGRADED
