@@ -82,6 +82,36 @@ hybrid inverter AC boundary; their difference is not qualified as battery-only.
 The full audit and gate are recorded in
 [`direct-energy-telemetry.md`](direct-energy-telemetry.md).
 
+## Direct diagnostic profile
+
+`DiagnosticReadProfile()` supports per-device observations before installed
+topology has been established. Pass it as the qualified client's `profile`;
+no Home Assistant connection or PV/grid/load configuration is required.
+
+Its `DiagnosticSnapshot.registers` is an immutable mapping of raw input-register
+observations for 0–39 and 80–119. Each observation retains acceptance time,
+source, response sequence/range and quality. The facade suppresses stale values
+at inspection time. Raw words, including `0xffff`, remain explicitly diagnostic;
+they are not validated physical measurements. The existing `direct_energy`
+fields still reject invalid power/SOC, missing provenance, incoherence and
+staleness using the same rules as the energy-flow profile.
+
+The diagnostic profile preserves exactly the existing qualified freshness demand
+`{0, 5, 7, 8, 9, 10, 11, 24, 26, 27, 114}` and its two aligned blocks. That is an
+acquisition policy, not an assertion of installed PV strings or load layout.
+Incidental raw fields do not become additional freshness-driving registers.
+Register 114 is not selected as household-load authority. Registers 7–9 are
+individual diagnostic DC/MPPT words; register 9 may be model-dependent. No PV sum,
+household load, site SOC, solar AC, battery-only AC or cross-device sum is exposed.
+The signed grid field is the documented 26-minus-27 pair, not proof of complete
+multi-phase grid coverage or a summable site measurement.
+
+The existing `EnergyFlowReadProfile` contract and its required capability
+configuration are unchanged. The additional diagnostic profile uses the same
+session/recovery implementation; it requires concurrent live qualification
+before claims about dual-device service operation. API version 2 is retained
+with additive profile and snapshot types.
+
 ## Packaging and dependencies
 
 The distribution requires Python 3.13 or newer, the version exercised by the

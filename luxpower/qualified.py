@@ -28,6 +28,8 @@ from custom_components.lxp_modbus.read_profiles import (
     DIRECT_ENERGY_TELEMETRY_DEFINITION_VERSION,
     ENERGY_FLOW_PROFILE_DEFINITION_VERSION,
     DirectEnergyTelemetrySnapshot,
+    DiagnosticReadProfile,
+    DiagnosticSnapshot,
     EnergyFlowReadProfile,
     EnergyFlowSnapshot,
     GridTopology,
@@ -64,7 +66,7 @@ class QualifiedLuxSnapshot:
 
     api_version: int
     direct_energy_definition_version: int
-    profile: EnergyFlowSnapshot
+    profile: EnergyFlowSnapshot | DiagnosticSnapshot
     field_definitions: tuple[ProfileField, ...]
     direct_energy_field_definitions: tuple[ProfileField, ...]
     acquisition_health: AcquisitionHealth
@@ -87,7 +89,7 @@ class QualifiedLuxReadClient:
         dongle_serial: str,
         inverter_serial: str,
         *,
-        profile: EnergyFlowReadProfile,
+        profile: EnergyFlowReadProfile | DiagnosticReadProfile,
         port: int = 8000,
         freshness_target: timedelta = QUALIFIED_FRESHNESS_TARGET,
         recovery_policy: RecoveryPolicy | None = RecoveryPolicy(),
@@ -95,8 +97,8 @@ class QualifiedLuxReadClient:
         tcp_keepalive_idle_seconds: int = 60,
         receive_inactivity_timeout: float | None = 900.0,
     ) -> None:
-        if not isinstance(profile, EnergyFlowReadProfile):
-            raise TypeError("profile must be an EnergyFlowReadProfile")
+        if not isinstance(profile, (EnergyFlowReadProfile, DiagnosticReadProfile)):
+            raise TypeError("profile must be an EnergyFlowReadProfile or DiagnosticReadProfile")
         session = _LuxReadSession(
             host,
             dongle_serial,
@@ -129,7 +131,7 @@ class QualifiedLuxReadClient:
         self._closed = False
 
     @property
-    def profile(self) -> EnergyFlowReadProfile:
+    def profile(self) -> EnergyFlowReadProfile | DiagnosticReadProfile:
         return self._profile
 
     @property
@@ -168,13 +170,19 @@ class QualifiedLuxReadClient:
         self._require_started()
         profile_snapshot = self._delegate.profile_snapshot()
         inspected_at = utc_now()
-        profile_snapshot = replace(
-            profile_snapshot,
-            direct_energy=profile_snapshot.direct_energy.unavailable_if_stale(
+        if isinstance(profile_snapshot, DiagnosticSnapshot):
+            profile_snapshot = profile_snapshot.unavailable_if_stale(
                 inspected_at=inspected_at,
                 freshness_target=self._freshness_target,
-            ),
-        )
+            )
+        else:
+            profile_snapshot = replace(
+                profile_snapshot,
+                direct_energy=profile_snapshot.direct_energy.unavailable_if_stale(
+                    inspected_at=inspected_at,
+                    freshness_target=self._freshness_target,
+                ),
+            )
         observed_at = profile_snapshot.observed_at
         fresh = (
             observed_at is not None
@@ -233,6 +241,8 @@ __all__ = [
     "EnergyFlowReadProfile",
     "EnergyFlowSnapshot",
     "DirectEnergyTelemetrySnapshot",
+    "DiagnosticReadProfile",
+    "DiagnosticSnapshot",
     "DIRECT_ENERGY_TELEMETRY_DEFINITION_VERSION",
     "GridTopology",
     "HybridProfileMetrics",

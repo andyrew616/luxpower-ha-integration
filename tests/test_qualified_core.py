@@ -30,6 +30,8 @@ from luxpower.qualified import (
 
 EXPECTED_PUBLIC_NAMES = {
     "AcquisitionHealth",
+    "DiagnosticReadProfile",
+    "DiagnosticSnapshot",
     "EnergyFlowReadProfile",
     "EnergyFlowSnapshot",
     "DirectEnergyTelemetrySnapshot",

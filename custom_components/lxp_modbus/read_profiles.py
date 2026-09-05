@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from enum import Enum
+from types import MappingProxyType
 from typing import Callable, Mapping
 
 from .classes.read_session import (
@@ -28,6 +29,7 @@ class ReadProfileName(str, Enum):
     """Stable names for supported input-register read profiles."""
 
     ENERGY_FLOW = "energy_flow"
+    DIAGNOSTIC = "diagnostic"
     FULL_INPUT = "full_input"
 
 
@@ -171,6 +173,40 @@ class EnergyFlowSnapshot:
     direct_energy: DirectEnergyTelemetrySnapshot
     required_registers: frozenset[int]
     observed_at: datetime | None
+
+
+@dataclass(frozen=True)
+class DiagnosticSnapshot:
+    """Raw per-device observations, without installed-topology attribution.
+
+    Raw words (including 0xffff) are diagnostic data, not validated electrical
+    measurements. The direct-energy fields retain their existing validation;
+    their grid pair is not a claim of complete multi-phase or site grid power.
+    """
+
+    registers: Mapping[int, ObservedProfileValue]
+    direct_energy: DirectEnergyTelemetrySnapshot
+    required_registers: frozenset[int]
+    observed_at: datetime | None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "registers", MappingProxyType(dict(self.registers)))
+
+    def unavailable_if_stale(
+        self, *, inspected_at: datetime, freshness_target: timedelta
+    ) -> "DiagnosticSnapshot":
+        return replace(
+            self,
+            registers={
+                register: value.unavailable_if_stale(
+                    inspected_at=inspected_at, freshness_target=freshness_target
+                )
+                for register, value in self.registers.items()
+            },
+            direct_energy=self.direct_energy.unavailable_if_stale(
+                inspected_at=inspected_at, freshness_target=freshness_target
+            ),
+        )
 
 
 _PV_POWER_REGISTERS = {
@@ -380,61 +416,7 @@ class EnergyFlowReadProfile:
             lambda values: sum(values[: len(self.grid_import_registers)])
             - sum(values[len(self.grid_import_registers) :]),
         )
-        pinv = _observed(
-            raw,
-            (input_register.I_PINV,),
-            lambda values: values[0],
-            validator=_valid_power_registers,
-            require_provenance=True,
-            require_same_observation=True,
-            required_observation_range=(0, HARDWARE_READ_BLOCK_SIZE),
-        )
-        prec = _observed(
-            raw,
-            (input_register.I_PREC,),
-            lambda values: values[0],
-            validator=_valid_power_registers,
-            require_provenance=True,
-            require_same_observation=True,
-            required_observation_range=(0, HARDWARE_READ_BLOCK_SIZE),
-        )
-        grid_export_positive = _observed(
-            raw,
-            (input_register.I_PTOGRID, input_register.I_PTOUSER),
-            lambda values: values[0] - values[1],
-            validator=_valid_power_registers,
-            require_provenance=True,
-            require_same_observation=True,
-            required_observation_range=(0, HARDWARE_READ_BLOCK_SIZE),
-        )
-        direct_soc = _observed(
-            raw,
-            (input_register.I_SOC_SOH,),
-            lambda values: values[0] & 0xFF,
-            validator=_valid_soc_register,
-            require_provenance=True,
-            require_same_observation=True,
-            required_observation_range=(0, HARDWARE_READ_BLOCK_SIZE),
-        )
-        coherent_sequence = _coherent_sequence(pinv, prec, grid_export_positive, direct_soc)
-        direct_observed_times = (
-            pinv.observed_at,
-            prec.observed_at,
-            grid_export_positive.observed_at,
-            direct_soc.observed_at,
-        )
-        direct_energy = DirectEnergyTelemetrySnapshot(
-            pinv_w=pinv,
-            prec_w=prec,
-            grid_signed_power_w=grid_export_positive,
-            soc_percent=direct_soc,
-            coherent_response_sequence=coherent_sequence,
-            observed_at=(
-                min(direct_observed_times)  # type: ignore[arg-type]
-                if all(item is not None for item in direct_observed_times)
-                else None
-            ),
-        )
+        direct_energy = _direct_energy_snapshot(raw)
         on_grid = _observed(raw, (self.on_grid_load_register,), lambda values: values[0])
         eps = _observed(raw, (input_register.I_PEPS,), lambda values: values[0])
         state_code = raw.input_registers.get(input_register.I_STATE)
@@ -477,6 +459,114 @@ class EnergyFlowReadProfile:
             required_registers=self.required_registers,
             observed_at=overall,
         )
+
+
+@dataclass(frozen=True)
+class DiagnosticReadProfile:
+    """Topology-neutral observations using the previously qualified block plan.
+
+    Required registers deliberately match the qualified PV1-3/12K acquisition
+    demand, solely to preserve freshness-driven I/O. Register 114 is a raw
+    diagnostic word here, not selected as household-load authority. No PV
+    strings, grid wiring, load layout or site aggregates are inferred.
+    """
+
+    @property
+    def name(self) -> ReadProfileName:
+        return ReadProfileName.DIAGNOSTIC
+
+    @property
+    def required_registers(self) -> frozenset[int]:
+        return frozenset({0, 5, 7, 8, 9, 10, 11, 24, 26, 27, 114})
+
+    @property
+    def read_blocks(self) -> tuple[InputReadBlock, ...]:
+        return plan_aligned_input_blocks(self.required_registers)
+
+    def required_registers_in(self, block: InputReadBlock) -> frozenset[int]:
+        return self.required_registers.intersection(block.addresses())
+
+    @property
+    def fields(self) -> tuple[ProfileField, ...]:
+        return tuple(
+            ProfileField(
+                f"input_register_{register}", (register,), None, 1, False,
+                "raw diagnostic word; no installed electrical authority", "",
+            )
+            for block in self.read_blocks for register in block.addresses()
+        )
+
+    @property
+    def direct_energy_fields(self) -> tuple[ProfileField, ...]:
+        return (
+            ProfileField("pinv_w", (16,), "W", 1, False,
+                         "whole-inverter AC output register; not solar/battery attributed", ""),
+            ProfileField("prec_w", (17,), "W", 1, False,
+                         "whole-inverter AC rectification register", ""),
+            ProfileField("grid_signed_power_w", (26, 27), "W", 1, True,
+                         "export minus import register pair; not proven site/multiphase total", ""),
+            ProfileField("soc_percent", (5,), "%", 1, False,
+                         "validated per-device SOC low byte; no site authority", ""),
+        )
+
+    def snapshot(self, raw: LuxReadSessionSnapshot) -> DiagnosticSnapshot:
+        registers = {
+            register: _observed(
+                raw, (register,), lambda values: values[0],
+                require_provenance=True, require_same_observation=True,
+                required_observation_range=(block.start, block.count),
+            )
+            for block in self.read_blocks for register in block.addresses()
+        }
+        required_times = [
+            raw.observed_at.input_registers.get(register)
+            for register in self.required_registers
+        ]
+        return DiagnosticSnapshot(
+            registers=registers,
+            direct_energy=_direct_energy_snapshot(raw),
+            required_registers=self.required_registers,
+            observed_at=(
+                min(required_times)
+                if all(item is not None for item in required_times)
+                else None
+            ),
+        )
+
+
+def _direct_energy_snapshot(raw: LuxReadSessionSnapshot) -> DirectEnergyTelemetrySnapshot:
+    """Shared, unchanged direct-energy validation for both profile boundaries."""
+    pinv = _observed(
+        raw, (input_register.I_PINV,), lambda values: values[0],
+        validator=_valid_power_registers, require_provenance=True,
+        require_same_observation=True,
+        required_observation_range=(0, HARDWARE_READ_BLOCK_SIZE),
+    )
+    prec = _observed(
+        raw, (input_register.I_PREC,), lambda values: values[0],
+        validator=_valid_power_registers, require_provenance=True,
+        require_same_observation=True,
+        required_observation_range=(0, HARDWARE_READ_BLOCK_SIZE),
+    )
+    grid = _observed(
+        raw, (input_register.I_PTOGRID, input_register.I_PTOUSER),
+        lambda values: values[0] - values[1],
+        validator=_valid_power_registers, require_provenance=True,
+        require_same_observation=True,
+        required_observation_range=(0, HARDWARE_READ_BLOCK_SIZE),
+    )
+    soc = _observed(
+        raw, (input_register.I_SOC_SOH,), lambda values: values[0] & 0xFF,
+        validator=_valid_soc_register, require_provenance=True,
+        require_same_observation=True,
+        required_observation_range=(0, HARDWARE_READ_BLOCK_SIZE),
+    )
+    times = (pinv.observed_at, prec.observed_at, grid.observed_at, soc.observed_at)
+    return DirectEnergyTelemetrySnapshot(
+        pinv_w=pinv, prec_w=prec, grid_signed_power_w=grid, soc_percent=soc,
+        coherent_response_sequence=_coherent_sequence(pinv, prec, grid, soc),
+        observed_at=min(times) if all(item is not None for item in times) else None,
+    )
 
 
 def _observed(
@@ -571,7 +661,9 @@ def _coherent_sequence(*values: ObservedProfileValue) -> int | None:
     return unique.pop() if len(unique) == 1 else None
 
 
-def profile_block_details(profile: EnergyFlowReadProfile) -> tuple[Mapping[str, object], ...]:
+def profile_block_details(
+    profile: EnergyFlowReadProfile | DiagnosticReadProfile,
+) -> tuple[Mapping[str, object], ...]:
     """Return sanitized deterministic planner details for docs and tooling."""
     details = []
     for block in profile.read_blocks:

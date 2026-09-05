@@ -38,6 +38,8 @@ from custom_components.lxp_modbus.observation import utc_now
 from custom_components.lxp_modbus.read_profiles import (
     EnergyFlowReadProfile,
     EnergyFlowSnapshot,
+    DiagnosticReadProfile,
+    DiagnosticSnapshot,
     InputReadBlock,
 )
 from custom_components.lxp_modbus.recovery import (
@@ -160,7 +162,7 @@ class LuxPowerHybridReadClient:
         port: int = 8000,
         freshness_target: timedelta = timedelta(seconds=5),
         full_scan_interval: timedelta = timedelta(seconds=60),
-        profile: EnergyFlowReadProfile | None = None,
+        profile: EnergyFlowReadProfile | DiagnosticReadProfile | None = None,
         session: LuxReadSession | None = None,
         recovery_policy: RecoveryPolicy | None = None,
         tcp_keepalive: bool = True,
@@ -286,7 +288,7 @@ class LuxPowerHybridReadClient:
         return self._session.receive_inactivity_timeout_seconds
 
     @property
-    def profile(self) -> EnergyFlowReadProfile | None:
+    def profile(self) -> EnergyFlowReadProfile | DiagnosticReadProfile | None:
         """The resolved experimental profile, if configured."""
         return self._profile
 
@@ -295,7 +297,7 @@ class LuxPowerHybridReadClient:
         """The opt-in sanitized recovery policy, if configured."""
         return self._recovery_policy
 
-    def profile_snapshot(self) -> EnergyFlowSnapshot:
+    def profile_snapshot(self) -> EnergyFlowSnapshot | DiagnosticSnapshot:
         """Return a typed profile snapshot with truthful derived freshness."""
         if self._profile is None:
             raise ValueError("no read profile configured")
