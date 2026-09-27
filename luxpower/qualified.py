@@ -44,6 +44,7 @@ from custom_components.lxp_modbus.recovery import (
     RecoveryMetrics,
     RecoveryPolicy,
 )
+from custom_components.lxp_modbus.timeout_diagnostics import LuxReadDiagnosticsSnapshot
 from luxpower.hybrid import (
     HybridProfileMetrics,
     LuxPowerHybridReadClient as _LuxPowerHybridReadClient,
@@ -211,6 +212,14 @@ class QualifiedLuxReadClient:
     def recovery_metrics(self) -> RecoveryMetrics:
         """Return detached recovery totals and bounded recent events."""
         return self._delegate.recovery_metrics()
+
+    def transport_diagnostics(self) -> LuxReadDiagnosticsSnapshot:
+        """Return the existing bounded metadata journal, without socket I/O.
+
+        Sequence numbers are local to this client, including its reconnects.
+        The UTC origin anchors relative monotonic times; no payloads are exposed.
+        """
+        return self._delegate.diagnostics()
 
     async def async_close(self) -> None:
         """Stop recovery and the sole reader task; repeated closes are harmless."""

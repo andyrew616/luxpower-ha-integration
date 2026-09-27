@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from collections import Counter, deque
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from enum import Enum
 import time
-from typing import Callable, Mapping
+from typing import Any, Callable, Mapping
 
 
 class LuxReadPurpose(str, Enum):
@@ -40,6 +41,11 @@ class LuxDiagnosticEventKind(str, Enum):
     CONNECTION_OPENED = "connection_opened"
     REQUEST_REGISTERED = "request_registered"
     WRITE_RETURNED = "write_returned"
+    WRITE_STARTED = "write_started"
+    BYTES_RECEIVED = "bytes_received"
+    FRAME_COMPLETED = "frame_completed"
+    OLD_GENERATION_FRAME = "old_generation_frame"
+    OLD_GENERATION_BYTES = "old_generation_bytes"
     DRAIN_COMPLETED = "drain_completed"
     MATCHED_FC4 = "matched_fc4"
     UNMATCHED_FC4 = "unmatched_fc4"
@@ -107,6 +113,9 @@ class LuxReadDiagnosticEvent:
     register_start: int | None = None
     register_count: int | None = None
     classification: str | None = None
+    byte_count: int | None = None
+    buffered_bytes: int | None = None
+    function_code: int | None = None
 
 
 @dataclass(frozen=True)
@@ -147,6 +156,7 @@ class LuxReadRequestDiagnostic:
     elapsed_ms: float
     first_event_sequence: int
     terminal_event_sequence: int
+    queued_monotonic_seconds: float | None = None
 
     @property
     def register_end(self) -> int:
@@ -184,6 +194,8 @@ class LuxReadDiagnosticsSnapshot:
     purpose_counts: Mapping[str, int] = field(default_factory=dict)
     block_attempt_counts: Mapping[str, int] = field(default_factory=dict)
     late_old_generation_frame_observation_supported: bool = False
+    origin_utc: str | None = None
+    passive_event_errors: int = 0
 
 
 @dataclass
@@ -223,12 +235,13 @@ class _DiagnosticRequestState:
     future_done_when_timeout_handled: bool = False
     generation_invalidated: bool = False
     finalized: bool = False
+    queued_relative: float | None = None
 
 
 class LuxReadDiagnosticJournal:
     """Non-blocking bounded journal which never stores packets or register values."""
 
-    SCHEMA_VERSION = 4
+    SCHEMA_VERSION = 5
 
     def __init__(
         self,
@@ -248,6 +261,7 @@ class LuxReadDiagnosticJournal:
             raise ValueError("diagnostic retention capacities must be positive")
         self._monotonic = monotonic
         self._origin = monotonic()
+        self._origin_utc = datetime.now(UTC).isoformat()
         self._event_capacity = event_capacity
         self._request_capacity = request_capacity
         self._failure_capacity = failure_capacity
@@ -260,6 +274,7 @@ class LuxReadDiagnosticJournal:
             maxlen=failure_capacity
         )
         self._event_total = 0
+        self._passive_event_errors = 0
         self._request_total = 0
         self._failure_total = 0
         self._next_request_sequence = 1
@@ -288,6 +303,9 @@ class LuxReadDiagnosticJournal:
         register_count: int | None = None,
         classification: str | None = None,
         at: float | None = None,
+        byte_count: int | None = None,
+        buffered_bytes: int | None = None,
+        function_code: int | None = None,
     ) -> LuxReadDiagnosticEvent:
         observed = self.now() if at is None else at
         self._event_total += 1
@@ -300,9 +318,21 @@ class LuxReadDiagnosticJournal:
             register_start=register_start,
             register_count=register_count,
             classification=classification,
+            byte_count=byte_count,
+            buffered_bytes=buffered_bytes,
+            function_code=function_code,
         )
         self._events.append(event)
         return event
+
+    def record_passive_event(
+        self, kind: LuxDiagnosticEventKind, generation: int, **metadata: Any
+    ) -> None:
+        """Additional diagnostic probes cannot fail the existing read lifecycle."""
+        try:
+            self.record_event(kind, generation, **metadata)
+        except Exception:  # noqa: BLE001 - observational probes must not fail transport
+            self._passive_event_errors += 1
 
     def begin_request(
         self,
@@ -317,6 +347,7 @@ class LuxReadDiagnosticJournal:
         context: LuxReadRequestContext,
         connection_opened_monotonic: float,
         requests_previously_on_generation: int,
+        queued_monotonic: float | None = None,
     ) -> _DiagnosticRequestState:
         if timeout_seconds is None and (
             drain_timeout_seconds is None or reply_timeout_seconds is None
@@ -371,6 +402,7 @@ class LuxReadDiagnosticJournal:
             connection_age=max(0.0, now - connection_opened_monotonic),
             requests_previously_on_generation=requests_previously_on_generation,
             first_event_sequence=self._event_total + 1,
+            queued_relative=round(queued_monotonic - self._origin, 6) if queued_monotonic is not None else None,
         )
         self._last_request_started = now
         self._purpose_counts[context.purpose.value] += 1
@@ -529,6 +561,7 @@ class LuxReadDiagnosticJournal:
             register_start=state.register_start,
             register_count=state.register_count,
             started_monotonic_seconds=state.started_relative,
+            queued_monotonic_seconds=state.queued_relative,
             time_since_previous_request_start_seconds=self._rounded(
                 state.previous_request_elapsed
             ),
@@ -599,6 +632,8 @@ class LuxReadDiagnosticJournal:
     def snapshot(self) -> LuxReadDiagnosticsSnapshot:
         return LuxReadDiagnosticsSnapshot(
             schema_version=self.SCHEMA_VERSION,
+            origin_utc=self._origin_utc,
+            passive_event_errors=self._passive_event_errors,
             run_duration_seconds=round(self.now() - self._origin, 6),
             event_capacity=self._event_capacity,
             events_total=self._event_total,
