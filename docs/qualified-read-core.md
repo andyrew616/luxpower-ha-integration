@@ -204,3 +204,42 @@ Packaging or documentation-only changes still require isolated import/install
 checks and the complete offline transport/profile regression suite. Diagnostic
 retention changes require rollover/counter tests proving that recovery decisions
 are unchanged. They do not qualify new telemetry fields.
+
+## Bounded observational journal (0.2.1)
+
+`QualifiedLuxReadClient.transport_diagnostics()` returns a detached snapshot of
+its existing journal without I/O. Request/event IDs are local to a client; owners
+must attach a new epoch when constructing another client. `origin_utc` anchors
+relative monotonic seconds approximately and is not inverter source time.
+
+Schema 5 adds queued time, write-start, received chunk length/residual buffer,
+parsed complete-frame function/register identity, and observations rejected at
+an old-generation fence. Existing events retain write-return/drain/match,
+rejection reasons and deadlines. Chunk receipt is not necessarily the requested
+response: unrelated traffic can arrive while a request is pending. Frame times
+are host processing times. Old-generation visibility only covers data actually
+delivered to this reader or routing function, not unread kernel/network bytes.
+The legacy `late_old_generation_frame_observation_supported` flag stays false:
+this does not claim complete observation after connection closure.
+
+These probes use the existing bounded ring (512 events, 4096 requests, 64 failure
+episodes); no packets, serial strings or register values are retained. Additional
+passive hook exceptions increment `passive_event_errors` and cannot fail a read.
+Consumers must persist explicit truncation/error counters and apply their own
+bounded retention. Request cadence, deadlines, matcher and recovery are unchanged.
+
+### Optional block-0 evidence-density acquisition
+
+`block0_evidence_density=True` requests a genuine block-0 acceptance at the
+publication tail of a UTC 20-second cell's profile acquisition. Other required
+blocks keep their age-based selection but run before block 0. Block 0 requires
+acceptance at/after this acquisition's start, the current cell start and any
+preceding explicit read's completion. An unsolicited response after that fence
+can suppress the explicit request. A successfully acquired cell can be reused
+until a new nonzero-block read creates another publication fence. Cached and
+failed refreshes never advance timestamps or satisfy a new fence.
+
+Default consumers retain the original age-only policy and read order. No
+freshness target, read size, timeout, ownership lock or recovery budget changes.
+The owner must schedule acquisition early in the cell; no scheduler is created.
+A failed read, slow publication or source skew can still leave cells unqualified.

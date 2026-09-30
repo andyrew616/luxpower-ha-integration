@@ -597,6 +597,7 @@ class LuxReadSession:
                 or reply_timeout is not None
             )
 
+        queued_monotonic = self._diagnostics.now()
         async with self._request_lock:
             if not self.connected or self._writer is None:
                 if self._connection_lost:
@@ -631,6 +632,7 @@ class LuxReadSession:
                     self._connection_opened_diagnostic_monotonic
                 ),
                 requests_previously_on_generation=self._requests_on_generation,
+                queued_monotonic=queued_monotonic,
             )
             self._requests_on_generation += 1
             pending = _PendingRead(
@@ -653,6 +655,10 @@ class LuxReadSession:
             drain_completed = False
             outcome: LuxReadRequestOutcome | None = None
             try:
+                self._diagnostics.record_passive_event(
+                    LuxDiagnosticEventKind.WRITE_STARTED, self._generation,
+                    request=diagnostic,
+                )
                 self._writer.write(packet)
                 self._diagnostics.mark_write_returned(diagnostic)
                 drain_budget = (
@@ -944,6 +950,10 @@ class LuxReadSession:
                 # A cancellation-resistant StreamReader implementation must not
                 # be able to deliver bytes from a closed generation.
                 if generation != self._generation:
+                    self._diagnostics.record_passive_event(
+                        LuxDiagnosticEventKind.OLD_GENERATION_BYTES, generation,
+                        byte_count=len(chunk), classification="generation_mismatch",
+                    )
                     return
                 if not chunk:
                     raise ConnectionResetError("LuxPower socket closed")
@@ -954,6 +964,11 @@ class LuxReadSession:
                 self._bytes_received += len(chunk)
                 malformed_before = decoder.stats().malformed_lengths
                 frames = decoder.feed(chunk)
+                self._diagnostics.record_passive_event(
+                    LuxDiagnosticEventKind.BYTES_RECEIVED, generation,
+                    request=self._pending_diagnostic(generation),
+                    byte_count=len(chunk), buffered_bytes=decoder.stats().buffered_bytes,
+                )
                 malformed_after = decoder.stats().malformed_lengths
                 self._invalid_frames += malformed_after - malformed_before
                 for _ in range(malformed_after - malformed_before):
@@ -1025,9 +1040,20 @@ class LuxReadSession:
 
     def _route_frame(self, frame: bytes, generation: int) -> None:
         if generation != self._generation:
+            self._diagnostics.record_passive_event(
+                LuxDiagnosticEventKind.OLD_GENERATION_FRAME, generation,
+                byte_count=len(frame), classification="generation_mismatch",
+            )
             return
         self._frames_received += 1
         response = LxpResponse(frame)
+        self._diagnostics.record_passive_event(
+            LuxDiagnosticEventKind.FRAME_COMPLETED, generation,
+            request=self._pending_diagnostic(generation), byte_count=len(frame),
+            function_code=response.device_function,
+            register_start=response.register,
+            register_count=len(response.parsed_values_dictionary),
+        )
 
         if not response.packet_error and response.tcp_function == 193:
             # Integrity and semantics are not established; diagnostics only.

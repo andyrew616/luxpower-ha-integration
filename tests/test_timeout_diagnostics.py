@@ -30,7 +30,8 @@ async def test_request_registration_precedes_write_and_records_success():
 
     def on_write(_packet):
         diagnostics = holder["session"].diagnostics()
-        assert diagnostics.events[-1].kind is LuxDiagnosticEventKind.REQUEST_REGISTERED
+        assert diagnostics.events[-2].kind is LuxDiagnosticEventKind.REQUEST_REGISTERED
+        assert diagnostics.events[-1].kind is LuxDiagnosticEventKind.WRITE_STARTED
         reader.feed(input_response(0))
 
     session = make_session(reader, FakeWriter(on_write))
@@ -210,7 +211,7 @@ def test_diagnostic_records_independent_phase_budgets():
 
     request = journal.finalize_request(state, LuxReadRequestOutcome.SUCCESS)
 
-    assert journal.snapshot().schema_version == 4
+    assert journal.snapshot().schema_version == 5
     assert request.timeout_budget_ms == 10000
     assert request.drain_timeout_budget_ms == 1000
     assert request.reply_timeout_budget_ms == 10000
