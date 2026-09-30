@@ -227,3 +227,19 @@ episodes); no packets, serial strings or register values are retained. Additiona
 passive hook exceptions increment `passive_event_errors` and cannot fail a read.
 Consumers must persist explicit truncation/error counters and apply their own
 bounded retention. Request cadence, deadlines, matcher and recovery are unchanged.
+
+### Optional block-0 evidence-density acquisition
+
+`block0_evidence_density=True` requests a genuine block-0 acceptance at the
+publication tail of a UTC 20-second cell's profile acquisition. Other required
+blocks keep their age-based selection but run before block 0. Block 0 requires
+acceptance at/after this acquisition's start, the current cell start and any
+preceding explicit read's completion. An unsolicited response after that fence
+can suppress the explicit request. A successfully acquired cell can be reused
+until a new nonzero-block read creates another publication fence. Cached and
+failed refreshes never advance timestamps or satisfy a new fence.
+
+Default consumers retain the original age-only policy and read order. No
+freshness target, read size, timeout, ownership lock or recovery budget changes.
+The owner must schedule acquisition early in the cell; no scheduler is created.
+A failed read, slow publication or source skew can still leave cells unqualified.

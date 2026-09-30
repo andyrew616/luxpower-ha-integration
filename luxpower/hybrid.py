@@ -6,7 +6,7 @@ import argparse
 import asyncio
 from collections import deque
 from dataclasses import asdict, dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 import json
 import math
 import os
@@ -162,6 +162,7 @@ class LuxPowerHybridReadClient:
         port: int = 8000,
         freshness_target: timedelta = timedelta(seconds=5),
         full_scan_interval: timedelta = timedelta(seconds=60),
+        block0_evidence_density: bool = False,
         profile: EnergyFlowReadProfile | DiagnosticReadProfile | None = None,
         session: LuxReadSession | None = None,
         recovery_policy: RecoveryPolicy | None = None,
@@ -184,6 +185,8 @@ class LuxPowerHybridReadClient:
             receive_inactivity_timeout=receive_inactivity_timeout,
         )
         self._freshness_target = freshness_target
+        self._block0_evidence_density = block0_evidence_density
+        self._block0_density_completed_cell: datetime | None = None
         self._full_scan_interval = full_scan_interval
         self._profile = profile
         self._recovery_policy = recovery_policy
@@ -404,15 +407,35 @@ class LuxPowerHybridReadClient:
         unsolicited: list[InputReadBlock] = []
         reconnects = 0
         active_recovery: _ActiveRecovery | None = None
+        acquisition_at = utc_now().astimezone(UTC)
+        acquisition_cell = acquisition_at.replace(second=acquisition_at.second // 20 * 20, microsecond=0)
+        density_fence = (acquisition_cell if self._block0_density_completed_cell == acquisition_cell
+                         else acquisition_at)
+        blocks = self._profile.read_blocks
+        if self._block0_evidence_density:
+            # Publish PV last: a slow later block must not strand its acceptance
+            # behind a conservative pending/degradation observation in that cell.
+            blocks = tuple(sorted(blocks, key=lambda block: block.start == 0))
         restart_selection = True
         while restart_selection:
             restart_selection = False
-            for block in self._profile.read_blocks:
+            for block in blocks:
                 required = self._profile.required_registers_in(block)
                 snapshot = self._session.snapshot()
                 now = utc_now()
                 fresh = self._required_registers_are_fresh(required, snapshot, now)
-                if not fresh:
+                # Density is a request decision, never a freshness promotion.
+                # PV must satisfy both the cell and publication fence; an older,
+                # still presentable cache cannot satisfy the new acquisition.
+                skip_read = fresh
+                if skip_read and self._block0_evidence_density and block.start == 0:
+                    utc = now.astimezone(UTC)
+                    cell_start = utc.replace(second=utc.second // 20 * 20, microsecond=0)
+                    skip_read = all(
+                        snapshot.observed_at.input_registers[register] >= max(cell_start, density_fence)
+                        for register in required
+                    )
+                if not skip_read:
                     self._profile_explicit_requests += 1
                     self._last_profile_request_block = block
                     request_started_at = utc_now().isoformat()
@@ -428,6 +451,8 @@ class LuxPowerHybridReadClient:
                             context=self._request_context(purpose),
                         )
                         requested.append(block)
+                        if self._block0_evidence_density and block.start != 0:
+                            density_fence = utc_now().astimezone(UTC)
                     except asyncio.CancelledError:
                         self._health = AcquisitionHealth.DEGRADED
                         if active_recovery is not None:
@@ -481,6 +506,12 @@ class LuxPowerHybridReadClient:
                 snapshot = self._session.snapshot()
                 now = utc_now()
                 observations = snapshot.observed_at.input_registers
+                if self._block0_evidence_density and block.start == 0:
+                    utc = now.astimezone(UTC)
+                    cell = utc.replace(second=utc.second // 20 * 20, microsecond=0)
+                    if all(observations.get(r, datetime.min.replace(tzinfo=UTC))
+                           >= max(cell, density_fence) for r in required):
+                        self._block0_density_completed_cell = cell
                 signature = (
                     tuple(observations[register] for register in sorted(required))
                     if all(register in observations for register in required)
@@ -499,7 +530,7 @@ class LuxPowerHybridReadClient:
                     accounted is None
                     or now - min(accounted) >= self._freshness_target
                 )
-                if fresh:
+                if skip_read:
                     skipped.append(block)
                     if opportunity_due and signature is not None and signature != accounted:
                         due_indexes = (
